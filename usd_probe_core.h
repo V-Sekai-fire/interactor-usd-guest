@@ -16,7 +16,7 @@ std::string init();
 // traverse UsdGeomMesh and UsdSkel prims. path_mode: 0 = USDA through
 // SdfLayer::ImportFromString on an anonymous layer, 1 = through the in-memory
 // resolver (UsdStage::Open("mem:/input.<ext>")). Returns one line:
-//   "ok fmt=usda prims=P meshes=M skels=S skelroots=R points=N fvi=F cksum=<hex>"
+//   "ok fmt=usda prims=P meshes=M skels=S skelroots=R points=N fvi=F mesh_blake3=<12 hex>"
 // or "ERR: <first error>".
 std::string load(const std::string &bytes, int path_mode);
 
