@@ -26,21 +26,26 @@
 #include "pxr/base/gf/vec2f.h"
 #include "pxr/base/gf/vec3f.h"
 #include "pxr/base/tf/errorMark.h"
+#include "pxr/base/tf/stringUtils.h"
 #include "pxr/base/tf/token.h"
 #include "pxr/base/vt/array.h"
+#include "pxr/base/vt/dictionary.h"
 #include "pxr/usd/ar/asset.h"
 #include "pxr/usd/ar/packageUtils.h"
 #include "pxr/usd/ar/resolvedPath.h"
 #include "pxr/usd/ar/resolver.h"
 #include "pxr/usd/sdf/assetPath.h"
 #include "pxr/usd/sdf/layer.h"
+#include "pxr/usd/sdf/path.h"
 #include "pxr/usd/sdf/types.h"
 #include "pxr/usd/usd/primRange.h"
 #include "pxr/usd/usd/stage.h"
+#include "pxr/usd/usdGeom/basisCurves.h"
 #include "pxr/usd/usdGeom/mesh.h"
 #include "pxr/usd/usdGeom/metrics.h"
 #include "pxr/usd/usdGeom/primvarsAPI.h"
 #include "pxr/usd/usdGeom/tokens.h"
+#include "pxr/usd/usdGeom/xform.h"
 #include "pxr/usd/usdGeom/xformCache.h"
 #include "pxr/usd/usdShade/connectableAPI.h"
 #include "pxr/usd/usdShade/input.h"
@@ -77,6 +82,16 @@ struct MeshRec {
 	float xf[16] = {};
 };
 
+// One curve of a BasisCurves prim: a stroke. A prim with N curveVertexCounts
+// gives N records, named <prim>_<k> when N > 1.
+struct CurveRec {
+	Span path, name;
+	size_t pt_off = 0, npts = 0; // into g_cpoints (3 floats a point)
+	bool boundary = false; // primvars:boundary authored true on the prim
+	Span b3_p;
+	float xf[16] = {};
+};
+
 struct MatRec {
 	Span path, name, shader;
 	float diffuse[3] = { 0.18f, 0.18f, 0.18f };
@@ -96,6 +111,9 @@ std::vector<float> g_points, g_normals, g_uvs;
 std::vector<int32_t> g_indices;
 std::vector<uint8_t> g_texdata;
 std::vector<MeshRec> g_meshes;
+std::vector<float> g_cpoints;
+std::vector<CurveRec> g_curves;
+std::vector<std::pair<std::string, std::string>> g_layer_data; // customLayerData, values as text
 std::vector<MatRec> g_mats;
 std::vector<TexRec> g_texs;
 std::string g_pkg_path; // the current asset's path in the resolver ("" when closed)
@@ -399,6 +417,53 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 	return "";
 }
 
+std::string add_curves(const UsdPrim &prim, UsdGeomXformCache &xc) {
+	UsdGeomBasisCurves bc(prim);
+	VtVec3fArray pts;
+	VtIntArray counts;
+	bc.GetPointsAttr().Get(&pts, UsdTimeCode::Default());
+	bc.GetCurveVertexCountsAttr().Get(&counts, UsdTimeCode::Default());
+	size_t total = 0;
+	for (int c : counts) {
+		if (c < 2)
+			return "a curve has " + std::to_string(c) + " point(s); a stroke needs 2 or more";
+		total += (size_t)c;
+	}
+	if (total != pts.size())
+		return "curveVertexCounts sum " + std::to_string(total) + " != points " + std::to_string(pts.size());
+	bool boundary = false;
+	UsdGeomPrimvar pv = UsdGeomPrimvarsAPI(prim).GetPrimvar(TfToken("boundary"));
+	if (pv && pv.HasAuthoredValue()) {
+		bool v = false;
+		if (pv.Get(&v, UsdTimeCode::Default()))
+			boundary = v;
+	}
+	const GfMatrix4d m = xc.GetLocalToWorldTransform(prim);
+	const std::string name = prim.GetName().GetString();
+	size_t at = 0;
+	for (size_t k = 0; k < counts.size(); ++k) {
+		CurveRec r;
+		r.path = intern(prim.GetPath().GetString());
+		r.name = intern(counts.size() == 1 ? name : name + "_" + std::to_string(k));
+		r.pt_off = g_cpoints.size() / 3;
+		r.npts = (size_t)counts[k];
+		for (size_t i = 0; i < r.npts; ++i) {
+			const GfVec3f &q = pts[at + i];
+			g_cpoints.push_back(q[0]);
+			g_cpoints.push_back(q[1]);
+			g_cpoints.push_back(q[2]);
+		}
+		at += r.npts;
+		r.boundary = boundary;
+		r.b3_p = intern(blake3::hex(g_cpoints.data() + r.pt_off * 3, r.npts * 3 * sizeof(float)));
+		for (int i = 0; i < 4; ++i)
+			for (int j = 0; j < 4; ++j)
+				r.xf[i * 4 + j] = (float)m[i][j];
+		g_curves.push_back(r);
+	}
+	return "";
+}
+
 void clear_tables() {
 	g_strings.clear();
 	g_points.clear();
@@ -407,6 +472,9 @@ void clear_tables() {
 	g_indices.clear();
 	g_texdata.clear();
 	g_meshes.clear();
+	g_curves.clear();
+	g_layer_data.clear();
+	g_cpoints.clear();
 	g_mats.clear();
 	g_texs.clear();
 	g_tex_by_path.clear();
@@ -414,6 +482,7 @@ void clear_tables() {
 	// Give the memory back to the guest heap: the next document may be bigger
 	// and the heap's ceiling is the whole sandbox.
 	std::vector<float>().swap(g_points);
+	std::vector<float>().swap(g_cpoints);
 	std::vector<float>().swap(g_normals);
 	std::vector<float>().swap(g_uvs);
 	std::vector<int32_t>().swap(g_indices);
@@ -462,11 +531,25 @@ std::string open(const std::string &bytes) {
 			close();
 			return e;
 		}
+		const VtDictionary cld = stage->GetRootLayer()->GetCustomLayerData();
+		for (VtDictionary::const_iterator it = cld.begin(); it != cld.end(); ++it) {
+			const VtValue &v = it->second;
+			g_layer_data.emplace_back(it->first, v.IsHolding<std::string>() ? v.UncheckedGet<std::string>() : TfStringify(v));
+		}
 		up = UsdGeomGetStageUpAxis(stage).GetString();
 		mpu = UsdGeomGetStageMetersPerUnit(stage);
 		UsdGeomXformCache xc(UsdTimeCode::Default());
 		for (const UsdPrim &prim : stage->Traverse()) {
 			++prims;
+			if (prim.IsA<UsdGeomBasisCurves>()) {
+				std::string err = add_curves(prim, xc);
+				if (!err.empty()) {
+					std::string e = "ERR: curves " + prim.GetPath().GetString() + ": " + err;
+					close();
+					return e;
+				}
+				continue;
+			}
 			if (!prim.IsA<UsdGeomMesh>())
 				continue;
 			std::string mwarn;
@@ -486,8 +569,8 @@ std::string open(const std::string &bytes) {
 		return s;
 	}
 	char buf[320];
-	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu",
-			ext, prims, g_meshes.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, bytes.size());
+	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu curves=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu",
+			ext, prims, g_meshes.size(), g_curves.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, bytes.size());
 	std::string out = buf;
 	if (!warn.empty())
 		out += " warn=" + warn;
@@ -505,6 +588,7 @@ void close() {
 }
 
 int mesh_count() { return (int)g_meshes.size(); }
+int curve_count() { return (int)g_curves.size(); }
 int material_count() { return (int)g_mats.size(); }
 int texture_count() { return (int)g_texs.size(); }
 
@@ -594,6 +678,94 @@ const uint8_t *texture_bytes(int i, size_t &n) {
 		return nullptr;
 	n = g_texs[i].size;
 	return g_texdata.data() + g_texs[i].data_off;
+}
+
+bool curve_info(int i, CurveInfo &out) {
+	if (i < 0 || (size_t)i >= g_curves.size())
+		return false;
+	const CurveRec &r = g_curves[i];
+	out.path = str(r.path);
+	out.name = str(r.name);
+	out.points = r.npts;
+	out.boundary = r.boundary;
+	out.blake3_points = str(r.b3_p);
+	std::memcpy(out.xform, r.xf, sizeof r.xf);
+	return true;
+}
+
+const std::vector<std::pair<std::string, std::string>> &layer_data() {
+	return g_layer_data;
+}
+
+const float *curve_points(int i, size_t &n) {
+	if (i < 0 || (size_t)i >= g_curves.size())
+		return nullptr;
+	n = g_curves[i].npts;
+	return g_cpoints.data() + g_curves[i].pt_off * 3;
+}
+
+std::string write_curves(const float *points, size_t n_points, const int32_t *counts, size_t n_curves,
+		const std::vector<std::string> &names, const std::vector<int32_t> &boundary,
+		const std::vector<std::pair<std::string, std::string>> &meta) {
+	const std::string init = usdmem::init();
+	if (init.compare(0, 3, "ok ") != 0)
+		return "ERR: init: " + init;
+	if (!names.empty() && names.size() != n_curves)
+		return "ERR: " + std::to_string(names.size()) + " names for " + std::to_string(n_curves) + " curves";
+	size_t total = 0;
+	for (size_t k = 0; k < n_curves; ++k) {
+		if (counts[k] < 2)
+			return "ERR: curve " + std::to_string(k) + " has " + std::to_string(counts[k]) + " point(s); a stroke needs 2 or more";
+		total += (size_t)counts[k];
+	}
+	if (total != n_points)
+		return "ERR: counts sum " + std::to_string(total) + " != points " + std::to_string(n_points);
+	std::vector<char> marked(n_curves, 0);
+	for (int32_t b : boundary) {
+		if (b < 0 || (size_t)b >= n_curves)
+			return "ERR: boundary index " + std::to_string(b) + " out of range";
+		marked[(size_t)b] = 1;
+	}
+	TfErrorMark mark;
+	try {
+		UsdStageRefPtr stage = UsdStage::CreateInMemory();
+		UsdGeomSetStageUpAxis(stage, UsdGeomTokens->y);
+		UsdGeomSetStageMetersPerUnit(stage, 1.0);
+		UsdGeomXform root = UsdGeomXform::Define(stage, SdfPath("/Creation"));
+		stage->SetDefaultPrim(root.GetPrim());
+		VtDictionary cld;
+		for (const std::pair<std::string, std::string> &kv : meta)
+			cld[kv.first] = VtValue(kv.second);
+		stage->GetRootLayer()->SetCustomLayerData(cld);
+		size_t at = 0;
+		for (size_t k = 0; k < n_curves; ++k) {
+			char dflt[32];
+			std::snprintf(dflt, sizeof dflt, "stroke_%03zu", k);
+			const std::string name = names.empty() ? std::string(dflt) : names[k];
+			if (!SdfPath::IsValidIdentifier(name))
+				return "ERR: curve " + std::to_string(k) + ": '" + name + "' is not a valid prim name";
+			UsdGeomBasisCurves bc = UsdGeomBasisCurves::Define(stage, SdfPath("/Creation/" + name));
+			bc.CreateTypeAttr(VtValue(UsdGeomTokens->linear));
+			VtVec3fArray pts((size_t)counts[k]);
+			for (size_t i = 0; i < pts.size(); ++i)
+				pts[i] = GfVec3f(points[(at + i) * 3], points[(at + i) * 3 + 1], points[(at + i) * 3 + 2]);
+			at += pts.size();
+			bc.CreatePointsAttr(VtValue(pts));
+			VtIntArray cvc(1, counts[k]);
+			bc.CreateCurveVertexCountsAttr(VtValue(cvc));
+			if (marked[k]) {
+				UsdGeomPrimvar pv = UsdGeomPrimvarsAPI(bc.GetPrim())
+						.CreatePrimvar(TfToken("boundary"), SdfValueTypeNames->Bool, UsdGeomTokens->uniform);
+				pv.Set(true);
+			}
+		}
+		std::string text;
+		if (!stage->GetRootLayer()->ExportToString(&text))
+			return "ERR: export failed: " + first_error(mark);
+		return text;
+	} catch (const std::exception &e) {
+		return std::string("ERR: write exception: ") + e.what();
+	}
 }
 
 } // namespace usdg

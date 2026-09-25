@@ -15,6 +15,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace usdg {
 
@@ -48,6 +50,29 @@ const float *mesh_points(int i, size_t &n_points);
 const float *mesh_normals(int i, size_t &n_points);
 const float *mesh_uvs(int i, size_t &n_points);
 const int32_t *mesh_indices(int i, size_t &n_triangles);
+
+// BasisCurves (the pen's stroke format): one record per curve, in Traverse()
+// order; boundary is primvars:boundary authored true on the curve's prim.
+int curve_count();
+struct CurveInfo {
+	std::string path, name;
+	size_t points = 0;
+	bool boundary = false;
+	std::string blake3_points; // BLAKE3 hex over the f32 xyz bytes
+	float xform[16] = {};
+};
+bool curve_info(int i, CurveInfo &out);
+const float *curve_points(int i, size_t &n_points);
+// The open document's customLayerData, each value as text (strings as-is).
+const std::vector<std::pair<std::string, std::string>> &layer_data();
+// A new layer, the inverse of the curves table: /Creation (upAxis Y,
+// metersPerUnit 1) with one linear BasisCurves prim per curve, named from
+// `names` or stroke_NNN, primvars:boundary authored only on the indices in
+// `boundary`, `meta` as customLayerData strings. Returns the .usda text or
+// "ERR: <reason>".
+std::string write_curves(const float *points, size_t n_points, const int32_t *counts, size_t n_curves,
+		const std::vector<std::string> &names, const std::vector<int32_t> &boundary,
+		const std::vector<std::pair<std::string, std::string>> &meta);
 
 struct MaterialInfo {
 	std::string path, name, shader_id; // shader_id "UsdPreviewSurface" or the surface's id / ""

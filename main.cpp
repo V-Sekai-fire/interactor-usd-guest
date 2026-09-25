@@ -282,6 +282,77 @@ static Variant usd_texture_slice(int i, int from, int count) {
 	});
 }
 
+static Variant usd_curve_count() {
+	return Variant(usdg::curve_count());
+}
+
+static Variant usd_curve_info(int i) {
+	return guarded("usd_curve_info", [&] {
+		usdg::CurveInfo c;
+		if (!usdg::curve_info(i, c))
+			return fail("usd_curve_info: no curve " + std::to_string(i) + " (count " + std::to_string(usdg::curve_count()) + ")");
+		Dictionary d = Dictionary::Create();
+		d["path"] = text(c.path);
+		d["name"] = text(c.name);
+		d["points"] = Variant((int64_t)c.points);
+		d["boundary"] = Variant(c.boundary);
+		d["blake3_points"] = text(c.blake3_points);
+		d["xform"] = Variant(PackedArray<float>(c.xform, 16));
+		return Variant(d);
+	});
+}
+
+static Variant usd_curve_points(int i) {
+	return guarded("usd_curve_points", [&] {
+		size_t n = 0;
+		const float *p = usdg::curve_points(i, n);
+		return float_slice("usd_curve_points", p, n, 3, 0, 0);
+	});
+}
+
+static Variant usd_layer_data() {
+	return guarded("usd_layer_data", [] {
+		Dictionary d = Dictionary::Create();
+		for (const std::pair<std::string, std::string> &kv : usdg::layer_data())
+			d[kv.first] = text(kv.second);
+		return Variant(d);
+	});
+}
+
+// Lines of text, one item per line; "k=v" lines for the metadata.
+static std::vector<std::string> lines_of(const std::string &s) {
+	std::vector<std::string> out;
+	size_t at = 0;
+	while (at < s.size()) {
+		size_t nl = s.find('\n', at);
+		if (nl == std::string::npos)
+			nl = s.size();
+		out.push_back(s.substr(at, nl - at));
+		at = nl + 1;
+	}
+	return out;
+}
+
+static Variant usd_write_curves(PackedArray<float> points, PackedArray<int32_t> counts, PackedArray<int32_t> boundary,
+		String names, String meta) {
+	return guarded("usd_write_curves", [&] {
+		const std::vector<float> p = points.fetch();
+		const std::vector<int32_t> c = counts.fetch();
+		const std::vector<int32_t> b = boundary.fetch();
+		if (p.size() % 3 != 0)
+			return fail("usd_write_curves: " + std::to_string(p.size()) + " floats is not whole xyz points");
+		const std::vector<std::string> n = lines_of(names.utf8());
+		std::vector<std::pair<std::string, std::string>> m;
+		for (const std::string &kv : lines_of(meta.utf8())) {
+			const size_t eq = kv.find('=');
+			if (eq == std::string::npos)
+				return fail("usd_write_curves: meta line '" + kv + "' has no '='");
+			m.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+		}
+		return text(usdg::write_curves(p.data(), p.size() / 3, c.data(), c.size(), n, b, m));
+	});
+}
+
 // UsdPreviewSurface as a Dictionary. Each of diffuse / metallic / roughness /
 // opacity / normal is a constant plus, when connected, <x>_texture (index
 // into the texture table), <x>_channel and <x>_file; the diffuse texture's
@@ -347,6 +418,13 @@ int main() {
 	ADD_API_FUNCTION(usd_texture_info, "Dictionary", "int i", "path, file, size of a texture");
 	ADD_API_FUNCTION(usd_texture, "PackedByteArray", "int i", "a texture's bytes as they are in the package");
 	ADD_API_FUNCTION(usd_texture_slice, "PackedByteArray", "int i, int from, int count", "texture bytes [from, from+count)");
+	ADD_API_FUNCTION(usd_curve_count, "int", "", "Curves (strokes) of the BasisCurves prims in the document");
+	ADD_API_FUNCTION(usd_curve_info, "Dictionary", "int i", "path, name, points, boundary, blake3_points, xform");
+	ADD_API_FUNCTION(usd_curve_points, "PackedFloat32Array", "int i", "xyz per point of curve i");
+	ADD_API_FUNCTION(usd_layer_data, "Dictionary", "", "The document's customLayerData, values as text");
+	ADD_API_FUNCTION(usd_write_curves, "String",
+			"PackedFloat32Array points, PackedInt32Array counts, PackedInt32Array boundary, String names, String meta",
+			"A .usda of linear BasisCurves under /Creation (names and k=v meta one per line), or ERR:");
 	ADD_API_FUNCTION(usd_blake3, "String", "PackedByteArray bytes", "BLAKE3 hex of the bytes (the gate's transfer check)");
 	halt();
 }
