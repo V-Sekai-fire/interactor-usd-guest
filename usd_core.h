@@ -74,6 +74,34 @@ std::string write_curves(const float *points, size_t n_points, const int32_t *co
 		const std::vector<std::string> &names, const std::vector<int32_t> &boundary,
 		const std::vector<std::pair<std::string, std::string>> &meta);
 
+// UsdSkelAnimation prims (RFD 2277 A2's motion clips), in Traverse() order.
+// A clip's transforms are, per authored time sample, per animated joint, the
+// parent-local transform UsdSkelAnimQuery composes: 12 floats, the row-major
+// 3x3 in the column-vector convention (rule 11: never a quaternion here; the
+// schema's quatf rotations are composed by OpenUSD), then the translation.
+int skel_anim_count();
+struct SkelAnimInfo {
+	std::string path;
+	std::string joints; // one joint path per line
+	size_t frames = 0, njoints = 0;
+	double fps = 0.0; // the stage's timeCodesPerSecond
+};
+bool skel_anim_info(int i, SkelAnimInfo &out);
+const float *skel_anim_transforms(int i, size_t &n_floats);
+// A new layer holding one motion clip: /Clip (a SkelRoot; upAxis Y,
+// metersPerUnit 1, timeCodesPerSecond = fps, time codes 0 .. frames-1) with
+// /Clip/Skeleton (every joint: joints are the names made valid identifiers
+// and nested by `parents`, jointNames the names as given, bindTransforms the
+// world rests, restTransforms the parent-local rests) and
+// /Clip/Skeleton/Motion (a SkelAnimation of the joints in `anim_joints`,
+// authored through UsdSkelAnimation::SetTransforms from anim_local, frames x
+// anim_joints x 12). rest_local and bind_world are J x 12 in the same layout.
+// Returns the .usda text or "ERR: <reason>".
+std::string write_skel_clip(const std::vector<std::string> &names, const std::vector<int32_t> &parents,
+		const float *rest_local, const float *bind_world, const std::vector<int32_t> &anim_joints,
+		const float *anim_local, size_t frames, double fps,
+		const std::vector<std::pair<std::string, std::string>> &meta);
+
 struct MaterialInfo {
 	std::string path, name, shader_id; // shader_id "UsdPreviewSurface" or the surface's id / ""
 	float diffuse[3] = { 0.18f, 0.18f, 0.18f };

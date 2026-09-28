@@ -53,8 +53,16 @@
 #include "pxr/usd/usdShade/materialBindingAPI.h"
 #include "pxr/usd/usdShade/shader.h"
 #include "pxr/usd/usdShade/tokens.h"
+#include "pxr/usd/usdSkel/animQuery.h"
+#include "pxr/usd/usdSkel/animation.h"
+#include "pxr/usd/usdSkel/bindingAPI.h"
+#include "pxr/usd/usdSkel/cache.h"
+#include "pxr/usd/usdSkel/root.h"
+#include "pxr/usd/usdSkel/skeleton.h"
+#include "pxr/usd/usdSkel/topology.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -116,6 +124,16 @@ std::vector<CurveRec> g_curves;
 std::vector<std::pair<std::string, std::string>> g_layer_data; // customLayerData, values as text
 std::vector<MatRec> g_mats;
 std::vector<TexRec> g_texs;
+// UsdSkelAnimation prims (motion clips, RFD 2277 A2): joints as one text
+// blob, parent-local transforms per time sample in g_animxf (12 floats a
+// joint: row-major 3x3 with column-vector convention, then the translation).
+struct AnimRec {
+	Span path, joints;
+	size_t xf_off = 0, frames = 0, njoints = 0;
+	double fps = 0.0;
+};
+std::vector<AnimRec> g_anims;
+std::vector<float> g_animxf;
 std::string g_pkg_path; // the current asset's path in the resolver ("" when closed)
 
 Span intern(const std::string &s) {
@@ -464,6 +482,81 @@ std::string add_curves(const UsdPrim &prim, UsdGeomXformCache &xc) {
 	return "";
 }
 
+// GfMatrix4d is row-vector (p' = p M): its upper 3x3 is the transpose of the
+// column-vector rotation the tables hold, and its row 3 is the translation.
+void matrix_to12(const GfMatrix4d &m, float *o) {
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c)
+			o[r * 3 + c] = (float)m[c][r];
+	o[9] = (float)m[3][0];
+	o[10] = (float)m[3][1];
+	o[11] = (float)m[3][2];
+}
+
+// The double nearest the shortest decimal that reads back as this float: the
+// same float, but the text writer prints it in ~9 digits, not the ~17 of
+// the float's exact double. It keeps a skeleton's matrix4d[] under the 64 KiB
+// a single value's text survives in the guest (gates/10-motion: past that,
+// ExportToString's text of the value is cut short; the writer's self-check
+// below refuses such a file).
+double short_double(float f) {
+	char buf[32];
+	for (int p = 6; p <= 9; ++p) {
+		std::snprintf(buf, sizeof buf, "%.*g", p, (double)f);
+		const double d = std::strtod(buf, nullptr);
+		if ((float)d == f)
+			return d;
+	}
+	return (double)f;
+}
+
+GfMatrix4d matrix_from12(const float *o) {
+	GfMatrix4d m(1.0);
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c)
+			m[c][r] = short_double(o[r * 3 + c]);
+	m[3][0] = short_double(o[9]);
+	m[3][1] = short_double(o[10]);
+	m[3][2] = short_double(o[11]);
+	return m;
+}
+
+// One UsdSkelAnimation: its joints and, per authored time sample, the
+// parent-local transforms UsdSkelAnimQuery composes from its translations,
+// rotations and scales.
+std::string add_anim(const UsdPrim &prim, double fps) {
+	UsdSkelCache cache;
+	UsdSkelAnimQuery q = cache.GetAnimQuery(prim);
+	if (!q)
+		return "no anim query";
+	std::vector<double> times;
+	q.GetJointTransformTimeSamples(&times);
+	const VtTokenArray joints = q.GetJointOrder();
+	AnimRec r;
+	r.path = intern(prim.GetPath().GetString());
+	std::string jl;
+	for (const TfToken &t : joints)
+		jl += t.GetString() + "\n";
+	r.joints = intern(jl);
+	r.njoints = joints.size();
+	r.fps = fps;
+	r.xf_off = g_animxf.size();
+	for (double t : times) {
+		VtMatrix4dArray xf;
+		if (!q.ComputeJointLocalTransforms(&xf, UsdTimeCode(t)))
+			return "ComputeJointLocalTransforms failed at time " + std::to_string(t);
+		if (xf.size() != joints.size())
+			return "transforms for " + std::to_string(xf.size()) + " of " + std::to_string(joints.size()) + " joints";
+		const size_t at = g_animxf.size();
+		g_animxf.resize(at + xf.size() * 12);
+		for (size_t j = 0; j < xf.size(); ++j)
+			matrix_to12(xf[j], &g_animxf[at + j * 12]);
+		++r.frames;
+	}
+	g_anims.push_back(r);
+	return "";
+}
+
 void clear_tables() {
 	g_strings.clear();
 	g_points.clear();
@@ -473,6 +566,8 @@ void clear_tables() {
 	g_texdata.clear();
 	g_meshes.clear();
 	g_curves.clear();
+	g_anims.clear();
+	std::vector<float>().swap(g_animxf);
 	g_layer_data.clear();
 	g_cpoints.clear();
 	g_mats.clear();
@@ -541,6 +636,15 @@ std::string open(const std::string &bytes) {
 		UsdGeomXformCache xc(UsdTimeCode::Default());
 		for (const UsdPrim &prim : stage->Traverse()) {
 			++prims;
+			if (prim.IsA<UsdSkelAnimation>()) {
+				std::string err = add_anim(prim, stage->GetTimeCodesPerSecond());
+				if (!err.empty()) {
+					std::string e = "ERR: skel animation " + prim.GetPath().GetString() + ": " + err;
+					close();
+					return e;
+				}
+				continue;
+			}
 			if (prim.IsA<UsdGeomBasisCurves>()) {
 				std::string err = add_curves(prim, xc);
 				if (!err.empty()) {
@@ -569,8 +673,8 @@ std::string open(const std::string &bytes) {
 		return s;
 	}
 	char buf[320];
-	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu curves=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu",
-			ext, prims, g_meshes.size(), g_curves.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, bytes.size());
+	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu curves=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu anims=%zu",
+			ext, prims, g_meshes.size(), g_curves.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, bytes.size(), g_anims.size());
 	std::string out = buf;
 	if (!warn.empty())
 		out += " warn=" + warn;
@@ -762,6 +866,153 @@ std::string write_curves(const float *points, size_t n_points, const int32_t *co
 		std::string text;
 		if (!stage->GetRootLayer()->ExportToString(&text))
 			return "ERR: export failed: " + first_error(mark);
+		return text;
+	} catch (const std::exception &e) {
+		return std::string("ERR: write exception: ") + e.what();
+	}
+}
+
+
+int skel_anim_count() { return (int)g_anims.size(); }
+
+bool skel_anim_info(int i, SkelAnimInfo &out) {
+	if (i < 0 || (size_t)i >= g_anims.size())
+		return false;
+	const AnimRec &r = g_anims[i];
+	out.path = str(r.path);
+	out.joints = str(r.joints);
+	out.frames = r.frames;
+	out.njoints = r.njoints;
+	out.fps = r.fps;
+	return true;
+}
+
+const float *skel_anim_transforms(int i, size_t &n_floats) {
+	n_floats = 0;
+	if (i < 0 || (size_t)i >= g_anims.size())
+		return nullptr;
+	n_floats = g_anims[i].frames * g_anims[i].njoints * 12;
+	return g_animxf.data() + g_anims[i].xf_off;
+}
+
+std::string write_skel_clip(const std::vector<std::string> &names, const std::vector<int32_t> &parents,
+		const float *rest_local, const float *bind_world, const std::vector<int32_t> &anim_joints,
+		const float *anim_local, size_t frames, double fps,
+		const std::vector<std::pair<std::string, std::string>> &meta) {
+	const std::string init = usdmem::init();
+	if (init.compare(0, 3, "ok ") != 0)
+		return "ERR: init: " + init;
+	const size_t J = names.size();
+	if (parents.size() != J)
+		return "ERR: " + std::to_string(parents.size()) + " parents for " + std::to_string(J) + " joints";
+	if (!(fps > 0.0) || frames == 0)
+		return "ERR: a clip needs frames and a positive fps";
+	for (int32_t a : anim_joints)
+		if (a < 0 || (size_t)a >= J)
+			return "ERR: animated joint " + std::to_string(a) + " out of range";
+	// UsdSkel orders parents before children; take a depth-first order.
+	std::vector<std::vector<size_t>> kids(J);
+	std::vector<size_t> order, rank(J, 0);
+	for (size_t j = 0; j < J; ++j) {
+		if (parents[j] >= (int32_t)J)
+			return "ERR: joint " + std::to_string(j) + " has parent " + std::to_string(parents[j]);
+		if (parents[j] >= 0)
+			kids[(size_t)parents[j]].push_back(j);
+	}
+	std::vector<size_t> stack;
+	for (size_t j = J; j-- > 0;)
+		if (parents[j] < 0)
+			stack.push_back(j);
+	while (!stack.empty()) {
+		const size_t j = stack.back();
+		stack.pop_back();
+		rank[j] = order.size();
+		order.push_back(j);
+		for (size_t k = kids[j].size(); k-- > 0;)
+			stack.push_back(kids[j][k]);
+	}
+	if (order.size() != J)
+		return "ERR: the parents do not form a forest";
+	// Joint paths: each name made a valid identifier (TfMakeValidIdentifier),
+	// unique among its siblings; the names themselves go in jointNames.
+	std::vector<std::string> path(J);
+	std::map<std::string, int> seen;
+	for (size_t j : order) {
+		std::string id = TfMakeValidIdentifier(names[j]);
+		std::string p = parents[j] < 0 ? id : path[(size_t)parents[j]] + "/" + id;
+		for (int n = 1; seen.count(p); ++n)
+			p = (parents[j] < 0 ? id : path[(size_t)parents[j]] + "/" + id) + "_" + std::to_string(n);
+		seen[p] = 1;
+		path[j] = p;
+	}
+	TfErrorMark mark;
+	try {
+		UsdStageRefPtr stage = UsdStage::CreateInMemory();
+		UsdGeomSetStageUpAxis(stage, UsdGeomTokens->y);
+		UsdGeomSetStageMetersPerUnit(stage, 1.0);
+		stage->SetTimeCodesPerSecond(fps);
+		stage->SetFramesPerSecond(fps);
+		stage->SetStartTimeCode(0.0);
+		stage->SetEndTimeCode(double(frames - 1));
+		UsdSkelRoot root = UsdSkelRoot::Define(stage, SdfPath("/Clip"));
+		stage->SetDefaultPrim(root.GetPrim());
+		VtDictionary cld;
+		for (const std::pair<std::string, std::string> &kv : meta)
+			cld[kv.first] = VtValue(kv.second);
+		stage->GetRootLayer()->SetCustomLayerData(cld);
+		UsdSkelSkeleton skel = UsdSkelSkeleton::Define(stage, SdfPath("/Clip/Skeleton"));
+		VtTokenArray jt(J), jn(J);
+		VtMatrix4dArray bind(J), rest(J);
+		for (size_t k = 0; k < J; ++k) {
+			const size_t j = order[k];
+			jt[k] = TfToken(path[j]);
+			jn[k] = TfToken(names[j]);
+			bind[k] = matrix_from12(bind_world + j * 12);
+			rest[k] = matrix_from12(rest_local + j * 12);
+		}
+		skel.CreateJointsAttr(VtValue(jt));
+		skel.CreateJointNamesAttr(VtValue(jn));
+		skel.CreateBindTransformsAttr(VtValue(bind));
+		skel.CreateRestTransformsAttr(VtValue(rest));
+		UsdSkelAnimation anim = UsdSkelAnimation::Define(stage, SdfPath("/Clip/Skeleton/Motion"));
+		const size_t A = anim_joints.size();
+		VtTokenArray at(A);
+		for (size_t a = 0; a < A; ++a)
+			at[a] = TfToken(path[(size_t)anim_joints[a]]);
+		anim.CreateJointsAttr(VtValue(at));
+		for (size_t f = 0; f < frames; ++f) {
+			VtMatrix4dArray xf(A);
+			for (size_t a = 0; a < A; ++a)
+				xf[a] = matrix_from12(anim_local + (f * A + a) * 12);
+			if (!anim.SetTransforms(xf, UsdTimeCode(double(f))))
+				return "ERR: SetTransforms failed at frame " + std::to_string(f) + ": " + first_error(mark);
+		}
+		UsdSkelBindingAPI::Apply(skel.GetPrim()).CreateAnimationSourceRel().SetTargets({ anim.GetPath() });
+		std::string why;
+		UsdSkelTopology topo(jt);
+		if (!topo.Validate(&why))
+			return "ERR: skeleton topology: " + why;
+		std::string text;
+		if (!stage->GetRootLayer()->ExportToString(&text))
+			return "ERR: export failed: " + first_error(mark);
+		// The text must parse back before it leaves (a writer that emits a
+		// file OpenUSD cannot read is refused here, not found by cage.elf).
+		SdfLayerRefPtr check = SdfLayer::CreateAnonymous(".usda");
+		if (!check->ImportFromString(text)) {
+			size_t longest = 0, at = 0, line = 1, start = 0;
+			for (size_t i = 0; i <= text.size(); ++i) {
+				if (i == text.size() || text[i] == '\n') {
+					if (i - start > longest) {
+						longest = i - start;
+						at = line;
+					}
+					start = i + 1;
+					++line;
+				}
+			}
+			return "ERR: the exported text does not parse back (" + std::to_string(text.size()) + " bytes, longest line " +
+					std::to_string(at) + " of " + std::to_string(longest) + " chars): " + first_error(mark).substr(0, 200);
+		}
 		return text;
 	} catch (const std::exception &e) {
 		return std::string("ERR: write exception: ") + e.what();

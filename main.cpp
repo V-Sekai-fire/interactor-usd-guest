@@ -353,6 +353,67 @@ static Variant usd_write_curves(PackedArray<float> points, PackedArray<int32_t> 
 	});
 }
 
+
+// RFD 2277 A2: one motion clip as a UsdSkel .usda (usdg::write_skel_clip).
+// rests: J x 24 floats, each joint's parent-local rest (12) then its world
+// bind (12); anim_local: frames x anim_joints x 12. Names and meta one per line.
+static Variant usd_write_skel_clip(String names, PackedArray<int32_t> parents, PackedArray<float> rests,
+		PackedArray<int32_t> anim_joints, PackedArray<float> anim_local, double fps, String meta) {
+	return guarded("usd_write_skel_clip", [&] {
+		const std::vector<std::string> n = lines_of(names.utf8());
+		const std::vector<int32_t> p = parents.fetch();
+		const std::vector<float> r = rests.fetch();
+		const std::vector<int32_t> aj = anim_joints.fetch();
+		const std::vector<float> al = anim_local.fetch();
+		if (r.size() != n.size() * 24)
+			return fail("usd_write_skel_clip: " + std::to_string(r.size()) + " rest floats for " + std::to_string(n.size()) + " joints");
+		if (aj.empty() || al.size() % (aj.size() * 12) != 0)
+			return fail("usd_write_skel_clip: animation floats are not frames x joints x 12");
+		std::vector<float> rest_local(n.size() * 12), bind_world(n.size() * 12);
+		for (size_t j = 0; j < n.size(); ++j) {
+			std::copy(&r[j * 24], &r[j * 24 + 12], &rest_local[j * 12]);
+			std::copy(&r[j * 24 + 12], &r[j * 24 + 24], &bind_world[j * 12]);
+		}
+		std::vector<std::pair<std::string, std::string>> m;
+		for (const std::string &kv : lines_of(meta.utf8())) {
+			const size_t eq = kv.find('=');
+			if (eq == std::string::npos)
+				return fail("usd_write_skel_clip: meta line '" + kv + "' has no '='");
+			m.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+		}
+		return text(usdg::write_skel_clip(n, p, rest_local.data(), bind_world.data(), aj, al.data(),
+				al.size() / (aj.size() * 12), fps, m));
+	});
+}
+
+static Variant usd_skel_anim_count() {
+	return Variant((int64_t)usdg::skel_anim_count());
+}
+
+static Variant usd_skel_anim_info(int i) {
+	return guarded("usd_skel_anim_info", [&] {
+		usdg::SkelAnimInfo a;
+		if (!usdg::skel_anim_info(i, a))
+			return fail("usd_skel_anim_info: no animation " + std::to_string(i));
+		Dictionary d = Dictionary::Create();
+		d["path"] = text(a.path);
+		d["joints"] = text(a.joints);
+		d["frames"] = Variant((int64_t)a.frames);
+		d["njoints"] = Variant((int64_t)a.njoints);
+		d["fps"] = Variant(a.fps);
+		return Variant(d);
+	});
+}
+
+static Variant usd_skel_anim_transforms(int i) {
+	size_t n = 0;
+	const float *p = usdg::skel_anim_transforms(i, n);
+	if (!p)
+		return fail("usd_skel_anim_transforms: no animation " + std::to_string(i));
+	if (n * sizeof(float) > kWholeLimit)
+		return fail("usd_skel_anim_transforms: past the 16 MiB view");
+	return Variant(PackedArray<float>(p, n));
+}
 // UsdPreviewSurface as a Dictionary. Each of diffuse / metallic / roughness /
 // opacity / normal is a constant plus, when connected, <x>_texture (index
 // into the texture table), <x>_channel and <x>_file; the diffuse texture's
@@ -425,6 +486,12 @@ int main() {
 	ADD_API_FUNCTION(usd_write_curves, "String",
 			"PackedFloat32Array points, PackedInt32Array counts, PackedInt32Array boundary, String names, String meta",
 			"A .usda of linear BasisCurves under /Creation (names and k=v meta one per line), or ERR:");
+	ADD_API_FUNCTION(usd_write_skel_clip, "String",
+			"String names, PackedInt32Array parents, PackedFloat32Array rests, PackedInt32Array anim_joints, PackedFloat32Array anim_local, float fps, String meta",
+			"A .usda of one UsdSkel motion clip (RFD 2277 A2), or ERR:");
+	ADD_API_FUNCTION(usd_skel_anim_count, "int", "", "UsdSkelAnimation prims in the document");
+	ADD_API_FUNCTION(usd_skel_anim_info, "Dictionary", "int i", "path, joints, frames, njoints, fps");
+	ADD_API_FUNCTION(usd_skel_anim_transforms, "PackedFloat32Array", "int i", "frames x joints x 12: parent-local 3x3 (row-major) then translation");
 	ADD_API_FUNCTION(usd_blake3, "String", "PackedByteArray bytes", "BLAKE3 hex of the bytes (the gate's transfer check)");
 	halt();
 }
