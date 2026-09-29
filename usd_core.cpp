@@ -26,6 +26,7 @@
 #include "pxr/base/gf/vec2f.h"
 #include "pxr/base/gf/vec3f.h"
 #include "pxr/base/tf/errorMark.h"
+#include "pxr/base/tf/pathUtils.h"
 #include "pxr/base/tf/stringUtils.h"
 #include "pxr/base/tf/token.h"
 #include "pxr/base/vt/array.h"
@@ -44,6 +45,7 @@
 #include "pxr/usd/usdGeom/mesh.h"
 #include "pxr/usd/usdGeom/metrics.h"
 #include "pxr/usd/usdGeom/primvarsAPI.h"
+#include "pxr/usd/usdGeom/subset.h"
 #include "pxr/usd/usdGeom/tokens.h"
 #include "pxr/usd/usdGeom/xform.h"
 #include "pxr/usd/usdGeom/xformCache.h"
@@ -94,6 +96,8 @@ struct MeshRec {
 	Span b3_p, b3_i; // BLAKE3 hex of the f32 point / i32 corner bytes, in g_strings
 	float xf[16] = {};
 	int skin = -1; // into g_skins
+	bool double_sided = false;
+	size_t surf_off = 0, nsurf = 0; // into g_surfaces, 3 ints a surface
 };
 
 struct SkelRec {
@@ -141,6 +145,8 @@ std::vector<float> g_points, g_normals, g_uvs;
 std::vector<int32_t> g_indices;
 std::vector<uint8_t> g_texdata;
 std::vector<MeshRec> g_meshes;
+std::vector<int32_t> g_surfaces;
+std::vector<std::string> g_tex_missing; // authored files that did not resolve or open, once each
 std::vector<float> g_cpoints;
 std::vector<CurveRec> g_curves;
 std::vector<std::pair<std::string, std::string>> g_layer_data; // customLayerData, values as text
@@ -193,27 +199,27 @@ int add_texture(const SdfAssetPath &ap, const std::string &layer_path, std::stri
 	if (resolved.empty() && !authored.empty()) {
 		ArResolver &r = ArGetResolver();
 		resolved = r.Resolve(authored).GetPathString();
-		if (resolved.empty() && !layer_path.empty() && authored[0] != '/')
-			resolved = ArJoinPackageRelativePath(layer_path, authored);
+		if (resolved.empty() && TfStringEndsWith(layer_path, ".usdz") && authored[0] != '/')
+			resolved = ArJoinPackageRelativePath(layer_path, TfNormPath(authored));
 	}
-	if (resolved.empty()) {
-		why = "texture '" + authored + "' does not resolve";
+	auto missing = [&](const std::string &w) {
+		why = w;
+		if (std::find(g_tex_missing.begin(), g_tex_missing.end(), authored) == g_tex_missing.end())
+			g_tex_missing.push_back(authored);
 		return -1;
-	}
+	};
+	if (resolved.empty())
+		return missing("texture '" + authored + "' does not resolve");
 	auto it = g_tex_by_path.find(resolved);
 	if (it != g_tex_by_path.end())
 		return it->second;
 	std::shared_ptr<ArAsset> asset = ArGetResolver().OpenAsset(ArResolvedPath(resolved));
-	if (!asset) {
-		why = "texture '" + resolved + "' cannot be opened";
-		return -1;
-	}
+	if (!asset)
+		return missing("texture '" + resolved + "' cannot be opened");
 	const size_t n = asset->GetSize();
 	std::shared_ptr<const char> buf = asset->GetBuffer();
-	if (!buf || n == 0) {
-		why = "texture '" + resolved + "' is empty";
-		return -1;
-	}
+	if (!buf || n == 0)
+		return missing("texture '" + resolved + "' is empty");
 	TexRec t;
 	t.path = intern(resolved);
 	t.file = intern(authored);
@@ -480,6 +486,32 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 	for (int h : holes)
 		if (h >= 0 && (size_t)h < hole.size())
 			hole[h] = 1;
+	mesh.GetDoubleSidedAttr().Get(&r.double_sided);
+
+	// Group 0 is the mesh's own binding; each materialBind GeomSubset is a group of its faces.
+	std::vector<int> group_mat(1, -1);
+	UsdShadeMaterial mat = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial();
+	std::string mwarn;
+	if (mat)
+		group_mat[0] = add_material(mat, layer_path, mwarn);
+	std::vector<int> face_group(fvc.size(), 0);
+	const std::vector<UsdGeomSubset> subsets = UsdShadeMaterialBindingAPI(prim).GetMaterialBindSubsets();
+	for (const UsdGeomSubset &s : subsets) {
+		TfToken et;
+		s.GetElementTypeAttr().Get(&et);
+		if (et != UsdGeomTokens->face)
+			continue;
+		VtIntArray faces;
+		s.GetIndicesAttr().Get(&faces, UsdTimeCode::Default());
+		UsdShadeMaterial sm = UsdShadeMaterialBindingAPI(s.GetPrim()).ComputeBoundMaterial();
+		const int g = (int)group_mat.size();
+		group_mat.push_back(sm ? add_material(sm, layer_path, mwarn) : -1);
+		for (int f : faces)
+			if (f >= 0 && (size_t)f < face_group.size())
+				face_group[(size_t)f] = g;
+	}
+	if (!mwarn.empty() && warn.empty())
+		warn = mwarn;
 
 	// vertices
 	r.pt_off = g_points.size();
@@ -511,11 +543,19 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 			push_pt((size_t)fvi[c], c);
 		r.npts = corners;
 	}
-	// triangles: a fan per face (corner 0, i, i+1), reversed for leftHanded
-	size_t c0 = 0;
-	for (size_t f = 0; f < fvc.size(); ++f) {
-		const size_t n = (size_t)fvc[f];
-		if (!hole[f] && n >= 3) {
+	// triangles: a fan per face (corner 0, i, i+1), reversed for leftHanded, in face order
+	// within each group and the groups one after another
+	std::vector<size_t> first_corner(fvc.size());
+	for (size_t f = 0, c0 = 0; f < fvc.size(); c0 += (size_t)fvc[f], ++f)
+		first_corner[f] = c0;
+	r.surf_off = g_surfaces.size();
+	for (size_t g = 0; g < group_mat.size(); ++g) {
+		const size_t first = r.ntris;
+		for (size_t f = 0; f < fvc.size(); ++f) {
+			const size_t n = (size_t)fvc[f];
+			const size_t c0 = first_corner[f];
+			if ((size_t)face_group[f] != g || hole[f] || n < 3)
+				continue;
 			for (size_t i = 1; i + 1 < n; ++i) {
 				int32_t a = r.indexed ? fvi[c0] : (int32_t)c0;
 				int32_t b = r.indexed ? fvi[c0 + i] : (int32_t)(c0 + i);
@@ -528,7 +568,12 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 				++r.ntris;
 			}
 		}
-		c0 += n;
+		if (group_mat.size() > 1 && r.ntris > first) {
+			g_surfaces.push_back(group_mat[g]);
+			g_surfaces.push_back((int32_t)first);
+			g_surfaces.push_back((int32_t)(r.ntris - first));
+			++r.nsurf;
+		}
 	}
 	r.b3_p = intern(blake3::hex(g_points.data() + r.pt_off, r.npts * 3 * sizeof(float)));
 	r.b3_i = intern(blake3::hex(g_indices.data() + r.idx_off, r.ntris * 3 * sizeof(int32_t)));
@@ -540,13 +585,7 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 			return err;
 	}
 
-	UsdShadeMaterial mat = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial();
-	if (mat) {
-		std::string mwarn;
-		r.material = add_material(mat, layer_path, mwarn);
-		if (!mwarn.empty() && warn.empty())
-			warn = mwarn;
-	}
+	r.material = group_mat[0];
 	g_meshes.push_back(r);
 	return "";
 }
@@ -752,6 +791,8 @@ void clear_tables() {
 	g_indices.clear();
 	g_texdata.clear();
 	g_meshes.clear();
+	std::vector<int32_t>().swap(g_surfaces);
+	g_tex_missing.clear();
 	g_curves.clear();
 	g_anims.clear();
 	std::vector<float>().swap(g_animxf);
@@ -900,11 +941,13 @@ std::string open(const std::string &bytes) {
 		close();
 		return s;
 	}
-	char buf[320];
-	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu curves=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu anims=%zu skels=%zu skins=%zu skins_unbound=%zu",
+	char buf[360];
+	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu curves=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu anims=%zu skels=%zu skins=%zu skins_unbound=%zu textures_missing=%zu",
 			ext, prims, g_meshes.size(), g_curves.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, bytes.size(), g_anims.size(),
-			g_skels.size(), g_skins.size(), skins_unbound);
+			g_skels.size(), g_skins.size(), skins_unbound, g_tex_missing.size());
 	std::string out = buf;
+	if (!g_tex_missing.empty())
+		out += " missing=" + TfStringJoin(g_tex_missing, ",");
 	if (!warn.empty())
 		out += " warn=" + warn;
 	if (!mark.IsClean())
@@ -941,6 +984,8 @@ bool mesh_info(int i, MeshInfo &out) {
 	out.blake3_indices = str(r.b3_i);
 	std::memcpy(out.xform, r.xf, sizeof r.xf);
 	out.skeleton = r.skin < 0 ? -1 : g_skins[(size_t)r.skin].skel;
+	out.double_sided = r.double_sided;
+	out.surfaces.assign(g_surfaces.begin() + (long)r.surf_off, g_surfaces.begin() + (long)(r.surf_off + 3 * r.nsurf));
 	return true;
 }
 

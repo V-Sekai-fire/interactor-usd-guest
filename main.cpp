@@ -168,6 +168,8 @@ static Variant usd_mesh_info(int i) {
 		d["blake3_indices"] = text(m.blake3_indices);
 		d["xform"] = Variant(PackedArray<float>(m.xform, 16));
 		d["skeleton"] = Variant(m.skeleton);
+		d["double_sided"] = Variant(m.double_sided);
+		d["surfaces"] = Variant(PackedArray<int32_t>(m.surfaces));
 		return Variant(d);
 	});
 }
@@ -589,7 +591,7 @@ int main() {
 	ADD_API_FUNCTION(usd_mesh_count, "int", "", "UsdGeomMesh prims in the document");
 	ADD_API_FUNCTION(usd_material_count, "int", "", "Bound materials in the document");
 	ADD_API_FUNCTION(usd_texture_count, "int", "", "Textures read out of the package");
-	ADD_API_FUNCTION(usd_mesh_info, "Dictionary", "int i", "path, name, points, triangles, has_normals, has_uvs, indexed, material, blake3_points, blake3_indices, xform");
+	ADD_API_FUNCTION(usd_mesh_info, "Dictionary", "int i", "path, name, points, triangles, has_normals, has_uvs, indexed, material, blake3_points, blake3_indices, xform, skeleton, double_sided, surfaces (material, first triangle, triangles per GeomSubset)");
 	ADD_API_FUNCTION(usd_mesh_points, "PackedFloat32Array", "int i", "xyz per point");
 	ADD_API_FUNCTION(usd_mesh_points_slice, "PackedFloat32Array", "int i, int from, int count", "points [from, from+count)");
 	ADD_API_FUNCTION(usd_mesh_normals, "PackedFloat32Array", "int i", "xyz per point (per-point normals)");

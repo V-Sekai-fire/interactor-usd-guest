@@ -26,8 +26,8 @@ std::string init();
 
 // Open bytes (a .usdz zip, or a USDA/USDC layer) as the current document.
 // Returns "ok layer=usdz|usdc|usda prims=P meshes=M materials=K textures=T
-// up=Y|Z mpu=<metersPerUnit> ..." or "ERR: <reason>". A previous document is
-// closed first.
+// up=Y|Z mpu=<metersPerUnit> ... textures_missing=N [missing=<file>,...]" or
+// "ERR: <reason>". A previous document is closed first.
 std::string open(const std::string &bytes);
 void close();
 // Sizes of the current document's tables (0 when nothing is open).
@@ -43,6 +43,10 @@ struct MeshInfo {
 	std::string blake3_points, blake3_indices; // BLAKE3 hex over the f32 / i32 bytes
 	float xform[16] = {}; // local-to-world, GfMatrix4d row-major (row i = image of axis i, row 3 = origin)
 	int skeleton = -1; // the bound skeleton when the mesh is skinned
+	bool double_sided = false;
+	// (material, first triangle, triangles) per run of a materialBind GeomSubset's faces;
+	// empty when the mesh has none and every triangle takes `material`.
+	std::vector<int32_t> surfaces;
 };
 bool mesh_info(int i, MeshInfo &out);
 // Views into the flat tables; n is the element count (points / triangles).
