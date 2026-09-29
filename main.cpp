@@ -167,6 +167,7 @@ static Variant usd_mesh_info(int i) {
 		d["blake3_points"] = text(m.blake3_points);
 		d["blake3_indices"] = text(m.blake3_indices);
 		d["xform"] = Variant(PackedArray<float>(m.xform, 16));
+		d["skeleton"] = Variant(m.skeleton);
 		return Variant(d);
 	});
 }
@@ -414,6 +415,129 @@ static Variant usd_skel_anim_transforms(int i) {
 		return fail("usd_skel_anim_transforms: past the 16 MiB view");
 	return Variant(PackedArray<float>(p, n));
 }
+static Variant usd_skeleton_count() {
+	return Variant(usdg::skeleton_count());
+}
+
+static Variant usd_skeleton_info(int i) {
+	return guarded("usd_skeleton_info", [&] {
+		usdg::SkeletonInfo s;
+		if (!usdg::skeleton_info(i, s))
+			return fail("usd_skeleton_info: no skeleton " + std::to_string(i) + " (count " + std::to_string(usdg::skeleton_count()) + ")");
+		Dictionary d = Dictionary::Create();
+		d["path"] = text(s.path);
+		d["joints"] = text(s.joints);
+		d["names"] = text(s.names);
+		d["njoints"] = Variant((int64_t)s.parents.size());
+		d["parents"] = Variant(PackedArray<int32_t>(s.parents.data(), s.parents.size()));
+		d["animation"] = text(s.animation);
+		d["rest_from_bind"] = Variant(s.rest_from_bind);
+		d["bind_from_rest"] = Variant(s.bind_from_rest);
+		d["xform"] = Variant(PackedArray<float>(s.xform, 16));
+		return Variant(d);
+	});
+}
+
+static Variant usd_skeleton_binds(int i) {
+	return guarded("usd_skeleton_binds", [&] {
+		size_t n = 0;
+		const float *p = usdg::skeleton_binds(i, n);
+		return float_slice("usd_skeleton_binds", p, n, 12, 0, 0);
+	});
+}
+
+static Variant usd_skeleton_binds_slice(int i, int from, int count) {
+	return guarded("usd_skeleton_binds_slice", [&] {
+		size_t n = 0;
+		const float *p = usdg::skeleton_binds(i, n);
+		return float_slice("usd_skeleton_binds_slice", p, n, 12, from, count);
+	});
+}
+
+static Variant usd_skeleton_rests(int i) {
+	return guarded("usd_skeleton_rests", [&] {
+		size_t n = 0;
+		const float *p = usdg::skeleton_rests(i, n);
+		return float_slice("usd_skeleton_rests", p, n, 12, 0, 0);
+	});
+}
+
+static Variant usd_skeleton_rests_slice(int i, int from, int count) {
+	return guarded("usd_skeleton_rests_slice", [&] {
+		size_t n = 0;
+		const float *p = usdg::skeleton_rests(i, n);
+		return float_slice("usd_skeleton_rests_slice", p, n, 12, from, count);
+	});
+}
+
+static Variant usd_mesh_skin(int i) {
+	return guarded("usd_mesh_skin", [&] {
+		usdg::SkinInfo k;
+		if (!usdg::mesh_skin(i, k))
+			return fail("usd_mesh_skin: mesh " + std::to_string(i) + " has no skin (meshes " + std::to_string(usdg::mesh_count()) + ")");
+		Dictionary d = Dictionary::Create();
+		d["skeleton"] = Variant(k.skeleton);
+		d["element_size"] = Variant(k.element_size);
+		d["max_nonzero"] = Variant(k.max_nonzero);
+		d["interpolation"] = text(k.interpolation);
+		d["joints"] = text(k.joints);
+		d["method"] = text(k.method);
+		d["geom_bind"] = Variant(PackedArray<float>(k.geom_bind, 16));
+		d["blake3_indices"] = text(k.blake3_indices);
+		d["blake3_weights"] = text(k.blake3_weights);
+		return Variant(d);
+	});
+}
+
+static Variant usd_mesh_skin_indices(int i) {
+	return guarded("usd_mesh_skin_indices", [&] {
+		size_t n = 0;
+		usdg::SkinInfo k;
+		const int32_t *p = usdg::mesh_skin_indices(i, n);
+		return int_slice("usd_mesh_skin_indices", p, n, usdg::mesh_skin(i, k) ? k.element_size : 1, 0, 0);
+	});
+}
+
+static Variant usd_mesh_skin_indices_slice(int i, int from, int count) {
+	return guarded("usd_mesh_skin_indices_slice", [&] {
+		size_t n = 0;
+		usdg::SkinInfo k;
+		const int32_t *p = usdg::mesh_skin_indices(i, n);
+		return int_slice("usd_mesh_skin_indices_slice", p, n, usdg::mesh_skin(i, k) ? k.element_size : 1, from, count);
+	});
+}
+
+static Variant usd_mesh_skin_weights(int i) {
+	return guarded("usd_mesh_skin_weights", [&] {
+		size_t n = 0;
+		usdg::SkinInfo k;
+		const float *p = usdg::mesh_skin_weights(i, n);
+		return float_slice("usd_mesh_skin_weights", p, n, usdg::mesh_skin(i, k) ? k.element_size : 1, 0, 0);
+	});
+}
+
+static Variant usd_mesh_skin_weights_slice(int i, int from, int count) {
+	return guarded("usd_mesh_skin_weights_slice", [&] {
+		size_t n = 0;
+		usdg::SkinInfo k;
+		const float *p = usdg::mesh_skin_weights(i, n);
+		return float_slice("usd_mesh_skin_weights_slice", p, n, usdg::mesh_skin(i, k) ? k.element_size : 1, from, count);
+	});
+}
+
+static Variant usd_mesh_skin_pose(int i, PackedArray<float> local, bool normalize) {
+	return guarded("usd_mesh_skin_pose", [&] {
+		const std::vector<float> l = local.fetch();
+		if (l.size() % 12 != 0)
+			return fail("usd_mesh_skin_pose: " + std::to_string(l.size()) + " floats is not whole joints of 12");
+		std::string why;
+		const std::vector<float> p = usdg::mesh_skin_pose(i, l.data(), l.size() / 12, normalize, why);
+		if (p.empty())
+			return fail("usd_mesh_skin_pose: " + why);
+		return float_slice("usd_mesh_skin_pose", p.data(), p.size() / 3, 3, 0, 0);
+	});
+}
+
 // UsdPreviewSurface as a Dictionary. Each of diffuse / metallic / roughness /
 // opacity / normal is a constant plus, when connected, <x>_texture (index
 // into the texture table), <x>_channel and <x>_file; the diffuse texture's
@@ -492,6 +616,19 @@ int main() {
 	ADD_API_FUNCTION(usd_skel_anim_count, "int", "", "UsdSkelAnimation prims in the document");
 	ADD_API_FUNCTION(usd_skel_anim_info, "Dictionary", "int i", "path, joints, frames, njoints, fps");
 	ADD_API_FUNCTION(usd_skel_anim_transforms, "PackedFloat32Array", "int i", "frames x joints x 12: parent-local 3x3 (row-major) then translation");
+	ADD_API_FUNCTION(usd_skeleton_count, "int", "", "UsdSkelSkeleton prims in the document");
+	ADD_API_FUNCTION(usd_skeleton_info, "Dictionary", "int i", "path, joints, names, njoints, parents, animation, rest_from_bind, bind_from_rest, xform");
+	ADD_API_FUNCTION(usd_skeleton_binds, "PackedFloat32Array", "int i", "joints x 12: bindTransforms, 3x3 (row-major) then translation");
+	ADD_API_FUNCTION(usd_skeleton_binds_slice, "PackedFloat32Array", "int i, int from, int count", "binds of joints [from, from+count)");
+	ADD_API_FUNCTION(usd_skeleton_rests, "PackedFloat32Array", "int i", "joints x 12: parent-local restTransforms, 3x3 (row-major) then translation");
+	ADD_API_FUNCTION(usd_skeleton_rests_slice, "PackedFloat32Array", "int i, int from, int count", "rests of joints [from, from+count)");
+	ADD_API_FUNCTION(usd_mesh_skin, "Dictionary", "int i", "skeleton, element_size, max_nonzero, interpolation, joints, method, geom_bind, blake3_indices, blake3_weights");
+	ADD_API_FUNCTION(usd_mesh_skin_indices, "PackedInt32Array", "int i", "element_size skeleton joint indices per vertex");
+	ADD_API_FUNCTION(usd_mesh_skin_indices_slice, "PackedInt32Array", "int i, int from, int count", "joint indices of vertices [from, from+count)");
+	ADD_API_FUNCTION(usd_mesh_skin_weights, "PackedFloat32Array", "int i", "element_size joint weights per vertex");
+	ADD_API_FUNCTION(usd_mesh_skin_weights_slice, "PackedFloat32Array", "int i, int from, int count", "joint weights of vertices [from, from+count)");
+	ADD_API_FUNCTION(usd_mesh_skin_pose, "PackedFloat32Array", "int i, PackedFloat32Array local, bool normalize",
+			"OpenUSD's linear blend skinning of mesh i under joint-local transforms (joints x 12), weights normalized or as authored: world xyz per vertex");
 	ADD_API_FUNCTION(usd_blake3, "String", "PackedByteArray bytes", "BLAKE3 hex of the bytes (the gate's transfer check)");
 	halt();
 }

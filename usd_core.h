@@ -42,6 +42,7 @@ struct MeshInfo {
 	int material = -1; // index into the material table, -1 unbound
 	std::string blake3_points, blake3_indices; // BLAKE3 hex over the f32 / i32 bytes
 	float xform[16] = {}; // local-to-world, GfMatrix4d row-major (row i = image of axis i, row 3 = origin)
+	int skeleton = -1; // the bound skeleton when the mesh is skinned
 };
 bool mesh_info(int i, MeshInfo &out);
 // Views into the flat tables; n is the element count (points / triangles).
@@ -101,6 +102,45 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 		const float *rest_local, const float *bind_world, const std::vector<int32_t> &anim_joints,
 		const float *anim_local, size_t frames, double fps,
 		const std::vector<std::pair<std::string, std::string>> &meta);
+
+// UsdSkelSkeleton prims, in Traverse() order. Joint transforms are 12 floats
+// as the animation table's: bind is each joint's bindTransforms entry, rest its
+// parent-local restTransforms entry (derived from the binds when not authored).
+int skeleton_count();
+struct SkeletonInfo {
+	std::string path;
+	std::string joints; // joint paths in skeleton order, one per line
+	std::string names; // jointNames when authored, else each joint path's last element; one per line
+	std::string animation; // skel:animationSource, "" when unbound
+	std::vector<int32_t> parents;
+	bool rest_from_bind = false, bind_from_rest = false;
+	float xform[16] = {}; // the skeleton prim's local-to-world, as MeshInfo::xform
+};
+bool skeleton_info(int i, SkeletonInfo &out);
+const float *skeleton_binds(int i, size_t &n_joints);
+const float *skeleton_rests(int i, size_t &n_joints);
+
+// A skinned mesh's influences, per vertex of its point table (a faceVarying
+// mesh repeats them per corner, a constant one per point), element_size a
+// vertex, joint indices in its skeleton's order (skel:joints resolved).
+struct SkinInfo {
+	int skeleton = -1;
+	int element_size = 0;
+	int max_nonzero = 0; // the most non-zero weights any vertex has
+	std::string interpolation; // as authored: vertex or constant
+	std::string joints; // the mesh's own joint order (skel:joints, else the skeleton's), one per line
+	std::string method; // skel:skinningMethod
+	float geom_bind[16] = {}; // as MeshInfo::xform
+	std::string blake3_indices, blake3_weights;
+};
+bool mesh_skin(int i, SkinInfo &out);
+const int32_t *mesh_skin_indices(int i, size_t &n_points);
+const float *mesh_skin_weights(int i, size_t &n_points);
+// OpenUSD's own linear blend skinning of mesh i with joint-local transforms
+// `local` (skeleton order, 12 floats a joint): world-space points, one per
+// vertex of the point table; `normalize` first scales each vertex's weights to
+// sum 1 (UsdSkelNormalizeWeights). Empty with `why` set on a bad input.
+std::vector<float> mesh_skin_pose(int i, const float *local, size_t n_joints, bool normalize, std::string &why);
 
 struct MaterialInfo {
 	std::string path, name, shader_id; // shader_id "UsdPreviewSurface" or the surface's id / ""

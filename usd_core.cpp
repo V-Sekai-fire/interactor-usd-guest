@@ -55,12 +55,17 @@
 #include "pxr/usd/usdShade/tokens.h"
 #include "pxr/usd/usdSkel/animQuery.h"
 #include "pxr/usd/usdSkel/animation.h"
+#include "pxr/usd/usdSkel/binding.h"
 #include "pxr/usd/usdSkel/bindingAPI.h"
 #include "pxr/usd/usdSkel/cache.h"
 #include "pxr/usd/usdSkel/root.h"
 #include "pxr/usd/usdSkel/skeleton.h"
+#include "pxr/usd/usdSkel/skeletonQuery.h"
+#include "pxr/usd/usdSkel/skinningQuery.h"
 #include "pxr/usd/usdSkel/topology.h"
+#include "pxr/usd/usdSkel/utils.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -88,6 +93,23 @@ struct MeshRec {
 	int material = -1;
 	Span b3_p, b3_i; // BLAKE3 hex of the f32 point / i32 corner bytes, in g_strings
 	float xf[16] = {};
+	int skin = -1; // into g_skins
+};
+
+struct SkelRec {
+	Span path, joints, names, anim;
+	size_t njoints = 0;
+	size_t par_off = 0; // into g_skel_parents
+	size_t xf_off = 0; // into g_skel_bind and g_skel_rest, 12 floats a joint
+	bool rest_from_bind = false, bind_from_rest = false;
+	float xf[16] = {};
+};
+
+struct SkinRec {
+	int skel = -1, element = 0, nonzero = 0;
+	Span interp, joints, method, b3_i, b3_w;
+	size_t off = 0; // into g_skin_idx / g_skin_w, element a vertex
+	float geom[16] = {};
 };
 
 // One curve of a BasisCurves prim: a stroke. A prim with N curveVertexCounts
@@ -134,6 +156,13 @@ struct AnimRec {
 };
 std::vector<AnimRec> g_anims;
 std::vector<float> g_animxf;
+std::vector<SkelRec> g_skels;
+std::vector<int32_t> g_skel_parents;
+std::vector<float> g_skel_bind, g_skel_rest;
+std::map<std::string, int> g_skel_by_path;
+std::vector<SkinRec> g_skins;
+std::vector<int32_t> g_skin_idx;
+std::vector<float> g_skin_w;
 std::string g_pkg_path; // the current asset's path in the resolver ("" when closed)
 
 Span intern(const std::string &s) {
@@ -286,7 +315,92 @@ bool read_pv(const UsdGeomPrimvar &pv, ArrayT *out, TfToken *interp) {
 	return pv.ComputeFlattened(out, UsdTimeCode::Default()) && !out->empty();
 }
 
-std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::string &layer_path, std::string &warn) {
+void matrix_to16(const GfMatrix4d &m, float *o) {
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j)
+			o[i * 4 + j] = (float)m[i][j];
+}
+
+struct SkinSrc {
+	UsdSkelSkinningQuery query;
+	int skel = -1;
+};
+
+// The mesh's joint influences, one run of elementSize per vertex of its point
+// table, joint indices mapped into the skeleton's order by the query's own
+// mapper (skel:joints). An index out of range, or a weight on a joint the
+// skeleton does not have, is refused.
+std::string add_skin(const SkinSrc &src, size_t usd_points, const VtIntArray &fvi, MeshRec &r) {
+	const UsdSkelSkinningQuery &q = src.query;
+	if (!q.HasJointInfluences())
+		return "";
+	VtIntArray ji;
+	VtFloatArray jw;
+	if (!q.ComputeJointInfluences(&ji, &jw))
+		return "joint influences do not compute";
+	const int e = q.GetNumInfluencesPerComponent();
+	const bool constant = q.GetInterpolation() == UsdGeomTokens->constant;
+	const size_t want = (constant ? 1 : usd_points) * (size_t)(e > 0 ? e : 0);
+	if (e <= 0 || ji.size() != want || jw.size() != want)
+		return "skin: " + std::to_string(ji.size()) + " indices and " + std::to_string(jw.size()) + " weights, elementSize " +
+				std::to_string(e) + " over " + std::to_string(usd_points) + " points (" + q.GetInterpolation().GetString() + ")";
+	const SkelRec &s = g_skels[(size_t)src.skel];
+	VtIntArray skel_order(s.njoints), to_skel;
+	for (size_t j = 0; j < s.njoints; ++j)
+		skel_order[j] = (int)j;
+	const UsdSkelAnimMapperRefPtr &mapper = q.GetJointMapper();
+	const int unmapped = -1;
+	if (mapper && !mapper->IsIdentity())
+		mapper->Remap(skel_order, &to_skel, 1, &unmapped);
+	else
+		to_skel = skel_order;
+	VtTokenArray order;
+	std::string jl;
+	if (q.GetJointOrder(&order)) {
+		for (const TfToken &t : order)
+			jl += t.GetString() + "\n";
+	} else {
+		jl = str(s.joints);
+	}
+	for (size_t k = 0; k < ji.size(); ++k) {
+		const int j = ji[k];
+		if (j < 0 || (size_t)j >= to_skel.size())
+			return "skin: joint index " + std::to_string(j) + " out of range (" + std::to_string(to_skel.size()) + " joints)";
+		if (to_skel[(size_t)j] < 0 && jw[k] != 0.0f)
+			return "skin: weight on joint " + std::to_string(j) + ", which the skeleton does not have";
+	}
+	SkinRec k;
+	k.skel = src.skel;
+	k.element = e;
+	k.interp = intern(q.GetInterpolation().GetString());
+	k.joints = intern(jl);
+	TfToken method = UsdSkelTokens->classicLinear;
+	if (q.GetSkinningMethodAttr())
+		q.GetSkinningMethodAttr().Get(&method);
+	k.method = intern(method.GetString());
+	matrix_to16(q.GetGeomBindTransform(), k.geom);
+	k.off = g_skin_idx.size();
+	for (size_t v = 0; v < r.npts; ++v) {
+		const size_t p = constant ? 0 : r.indexed ? v : (size_t)fvi[v];
+		int nonzero = 0;
+		for (int c = 0; c < e; ++c) {
+			const int mapped = to_skel[(size_t)ji[p * e + c]];
+			g_skin_idx.push_back(mapped < 0 ? 0 : mapped);
+			g_skin_w.push_back(mapped < 0 ? 0.0f : jw[p * e + c]);
+			nonzero += g_skin_w.back() != 0.0f;
+		}
+		k.nonzero = std::max(k.nonzero, nonzero);
+	}
+	const size_t n = r.npts * (size_t)e;
+	k.b3_i = intern(blake3::hex(g_skin_idx.data() + k.off, n * sizeof(int32_t)));
+	k.b3_w = intern(blake3::hex(g_skin_w.data() + k.off, n * sizeof(float)));
+	r.skin = (int)g_skins.size();
+	g_skins.push_back(k);
+	return "";
+}
+
+std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::string &layer_path, const SkinSrc *skin,
+		std::string &warn) {
 	UsdGeomMesh mesh(prim);
 	MeshRec r;
 	r.path = intern(prim.GetPath().GetString());
@@ -419,10 +533,12 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 	r.b3_p = intern(blake3::hex(g_points.data() + r.pt_off, r.npts * 3 * sizeof(float)));
 	r.b3_i = intern(blake3::hex(g_indices.data() + r.idx_off, r.ntris * 3 * sizeof(int32_t)));
 
-	const GfMatrix4d m = xc.GetLocalToWorldTransform(prim);
-	for (int i = 0; i < 4; ++i)
-		for (int j = 0; j < 4; ++j)
-			r.xf[i * 4 + j] = (float)m[i][j];
+	matrix_to16(xc.GetLocalToWorldTransform(prim), r.xf);
+	if (skin) {
+		const std::string err = add_skin(*skin, pts.size(), fvi, r);
+		if (!err.empty())
+			return err;
+	}
 
 	UsdShadeMaterial mat = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial();
 	if (mat) {
@@ -521,6 +637,77 @@ GfMatrix4d matrix_from12(const float *o) {
 	return m;
 }
 
+GfMatrix4d matrix_exact12(const float *o) {
+	GfMatrix4d m(1.0);
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 3; ++c)
+			m[c][r] = o[r * 3 + c];
+	m[3][0] = o[9];
+	m[3][1] = o[10];
+	m[3][2] = o[11];
+	return m;
+}
+
+// One UsdSkelSkeleton: joint order, parents, binds and parent-local rests.
+// Without restTransforms the rest is derived from the binds, without
+// bindTransforms the bind is the rest in skeleton space.
+std::string add_skeleton(const UsdPrim &prim, const UsdSkelCache &cache, UsdGeomXformCache &xc) {
+	UsdSkelSkeleton skel(prim);
+	UsdSkelSkeletonQuery q = cache.GetSkelQuery(skel);
+	if (!q)
+		return "no skeleton query";
+	const VtTokenArray joints = q.GetJointOrder();
+	const size_t J = joints.size();
+	const UsdSkelTopology &topo = q.GetTopology();
+	std::string why;
+	if (J == 0 || !topo.Validate(&why))
+		return "topology: " + (J == 0 ? std::string("no joints") : why);
+	const VtIntArray &parents = topo.GetParentIndices();
+	VtMatrix4dArray bind, rest;
+	const bool has_bind = q.GetJointWorldBindTransforms(&bind) && bind.size() == J;
+	const bool has_rest = q.HasRestPose() && q.ComputeJointLocalTransforms(&rest, UsdTimeCode::Default(), true) && rest.size() == J;
+	if (!has_bind && !has_rest)
+		return "neither bindTransforms nor restTransforms for " + std::to_string(J) + " joints";
+	SkelRec r;
+	if (!has_rest) {
+		rest.resize(J);
+		for (size_t j = 0; j < J; ++j)
+			rest[j] = parents[j] < 0 ? bind[j] : bind[j] * bind[(size_t)parents[j]].GetInverse();
+		r.rest_from_bind = true;
+	}
+	if (!has_bind) {
+		if (!q.ComputeJointSkelTransforms(&bind, UsdTimeCode::Default(), true) || bind.size() != J)
+			return "no bind pose and the rest does not compose";
+		r.bind_from_rest = true;
+	}
+	r.path = intern(prim.GetPath().GetString());
+	VtTokenArray names;
+	skel.GetJointNamesAttr().Get(&names);
+	std::string jl, nl;
+	for (size_t j = 0; j < J; ++j) {
+		jl += joints[j].GetString() + "\n";
+		nl += (names.size() == J ? names[j].GetString() : SdfPath(joints[j].GetString()).GetName()) + "\n";
+	}
+	r.joints = intern(jl);
+	r.names = intern(nl);
+	UsdPrim anim;
+	r.anim = intern(UsdSkelBindingAPI(prim).GetAnimationSource(&anim) && anim ? anim.GetPath().GetString() : std::string());
+	r.njoints = J;
+	r.par_off = g_skel_parents.size();
+	g_skel_parents.insert(g_skel_parents.end(), parents.begin(), parents.end());
+	r.xf_off = g_skel_bind.size();
+	g_skel_bind.resize(r.xf_off + J * 12);
+	g_skel_rest.resize(r.xf_off + J * 12);
+	for (size_t j = 0; j < J; ++j) {
+		matrix_to12(bind[j], &g_skel_bind[r.xf_off + j * 12]);
+		matrix_to12(rest[j], &g_skel_rest[r.xf_off + j * 12]);
+	}
+	matrix_to16(xc.GetLocalToWorldTransform(prim), r.xf);
+	g_skel_by_path[prim.GetPath().GetString()] = (int)g_skels.size();
+	g_skels.push_back(r);
+	return "";
+}
+
 // One UsdSkelAnimation: its joints and, per authored time sample, the
 // parent-local transforms UsdSkelAnimQuery composes from its translations,
 // rotations and scales.
@@ -568,6 +755,14 @@ void clear_tables() {
 	g_curves.clear();
 	g_anims.clear();
 	std::vector<float>().swap(g_animxf);
+	g_skels.clear();
+	g_skel_by_path.clear();
+	g_skins.clear();
+	std::vector<int32_t>().swap(g_skel_parents);
+	std::vector<float>().swap(g_skel_bind);
+	std::vector<float>().swap(g_skel_rest);
+	std::vector<int32_t>().swap(g_skin_idx);
+	std::vector<float>().swap(g_skin_w);
 	g_layer_data.clear();
 	g_cpoints.clear();
 	g_mats.clear();
@@ -613,6 +808,7 @@ std::string open(const std::string &bytes) {
 	std::string warn;
 	std::string up = "Y";
 	double mpu = 1.0;
+	size_t skins_unbound = 0;
 	try {
 		SdfLayerRefPtr layer = SdfLayer::FindOrOpen(g_pkg_path);
 		if (!layer) {
@@ -634,6 +830,36 @@ std::string open(const std::string &bytes) {
 		up = UsdGeomGetStageUpAxis(stage).GetString();
 		mpu = UsdGeomGetStageMetersPerUnit(stage);
 		UsdGeomXformCache xc(UsdTimeCode::Default());
+		UsdSkelCache skel_cache;
+		std::map<std::string, SkinSrc> skinned;
+		size_t bound = 0;
+		for (const UsdPrim &prim : stage->Traverse()) {
+			if (!prim.IsA<UsdSkelSkeleton>())
+				continue;
+			const std::string err = add_skeleton(prim, skel_cache, xc);
+			if (!err.empty()) {
+				std::string e = "ERR: skeleton " + prim.GetPath().GetString() + ": " + err;
+				close();
+				return e;
+			}
+		}
+		for (const UsdPrim &prim : stage->Traverse()) {
+			if (prim.HasAPI<UsdSkelBindingAPI>() && prim.IsA<UsdGeomMesh>())
+				++bound;
+			if (!prim.IsA<UsdSkelRoot>())
+				continue;
+			const UsdSkelRoot root(prim);
+			std::vector<UsdSkelBinding> bindings;
+			skel_cache.Populate(root, UsdPrimDefaultPredicate);
+			skel_cache.ComputeSkelBindings(root, &bindings, UsdPrimDefaultPredicate);
+			for (const UsdSkelBinding &b : bindings) {
+				std::map<std::string, int>::const_iterator s = g_skel_by_path.find(b.GetSkeleton().GetPath().GetString());
+				if (s == g_skel_by_path.end())
+					continue;
+				for (const UsdSkelSkinningQuery &q : b.GetSkinningTargets())
+					skinned[q.GetPrim().GetPath().GetString()] = SkinSrc{ q, s->second };
+			}
+		}
 		for (const UsdPrim &prim : stage->Traverse()) {
 			++prims;
 			if (prim.IsA<UsdSkelAnimation>()) {
@@ -657,7 +883,8 @@ std::string open(const std::string &bytes) {
 			if (!prim.IsA<UsdGeomMesh>())
 				continue;
 			std::string mwarn;
-			std::string err = add_mesh(prim, xc, g_pkg_path, mwarn);
+			std::map<std::string, SkinSrc>::const_iterator sk = skinned.find(prim.GetPath().GetString());
+			std::string err = add_mesh(prim, xc, g_pkg_path, sk == skinned.end() ? nullptr : &sk->second, mwarn);
 			if (!err.empty()) {
 				std::string e = "ERR: mesh " + prim.GetPath().GetString() + ": " + err;
 				close();
@@ -666,6 +893,7 @@ std::string open(const std::string &bytes) {
 			if (!mwarn.empty() && warn.empty())
 				warn = prim.GetName().GetString() + ": " + mwarn;
 		}
+		skins_unbound = bound > g_skins.size() ? bound - g_skins.size() : 0;
 		// The stage and layer go out of scope here; the flat tables stay.
 	} catch (const std::exception &e) {
 		std::string s = std::string("ERR: ") + ext + " exception: " + e.what();
@@ -673,8 +901,9 @@ std::string open(const std::string &bytes) {
 		return s;
 	}
 	char buf[320];
-	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu curves=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu anims=%zu",
-			ext, prims, g_meshes.size(), g_curves.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, bytes.size(), g_anims.size());
+	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu curves=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu anims=%zu skels=%zu skins=%zu skins_unbound=%zu",
+			ext, prims, g_meshes.size(), g_curves.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, bytes.size(), g_anims.size(),
+			g_skels.size(), g_skins.size(), skins_unbound);
 	std::string out = buf;
 	if (!warn.empty())
 		out += " warn=" + warn;
@@ -711,7 +940,123 @@ bool mesh_info(int i, MeshInfo &out) {
 	out.blake3_points = str(r.b3_p);
 	out.blake3_indices = str(r.b3_i);
 	std::memcpy(out.xform, r.xf, sizeof r.xf);
+	out.skeleton = r.skin < 0 ? -1 : g_skins[(size_t)r.skin].skel;
 	return true;
+}
+
+int skeleton_count() { return (int)g_skels.size(); }
+
+bool skeleton_info(int i, SkeletonInfo &out) {
+	if (i < 0 || (size_t)i >= g_skels.size())
+		return false;
+	const SkelRec &r = g_skels[i];
+	out.path = str(r.path);
+	out.joints = str(r.joints);
+	out.names = str(r.names);
+	out.animation = str(r.anim);
+	out.parents.assign(g_skel_parents.begin() + (long)r.par_off, g_skel_parents.begin() + (long)(r.par_off + r.njoints));
+	out.rest_from_bind = r.rest_from_bind;
+	out.bind_from_rest = r.bind_from_rest;
+	std::memcpy(out.xform, r.xf, sizeof r.xf);
+	return true;
+}
+
+const float *skeleton_binds(int i, size_t &n) {
+	if (i < 0 || (size_t)i >= g_skels.size())
+		return nullptr;
+	n = g_skels[i].njoints;
+	return g_skel_bind.data() + g_skels[i].xf_off;
+}
+
+const float *skeleton_rests(int i, size_t &n) {
+	if (i < 0 || (size_t)i >= g_skels.size())
+		return nullptr;
+	n = g_skels[i].njoints;
+	return g_skel_rest.data() + g_skels[i].xf_off;
+}
+
+bool mesh_skin(int i, SkinInfo &out) {
+	if (i < 0 || (size_t)i >= g_meshes.size() || g_meshes[i].skin < 0)
+		return false;
+	const SkinRec &k = g_skins[(size_t)g_meshes[i].skin];
+	out.skeleton = k.skel;
+	out.element_size = k.element;
+	out.max_nonzero = k.nonzero;
+	out.interpolation = str(k.interp);
+	out.joints = str(k.joints);
+	out.method = str(k.method);
+	std::memcpy(out.geom_bind, k.geom, sizeof k.geom);
+	out.blake3_indices = str(k.b3_i);
+	out.blake3_weights = str(k.b3_w);
+	return true;
+}
+
+const int32_t *mesh_skin_indices(int i, size_t &n) {
+	if (i < 0 || (size_t)i >= g_meshes.size() || g_meshes[i].skin < 0)
+		return nullptr;
+	n = g_meshes[i].npts;
+	return g_skin_idx.data() + g_skins[(size_t)g_meshes[i].skin].off;
+}
+
+const float *mesh_skin_weights(int i, size_t &n) {
+	if (i < 0 || (size_t)i >= g_meshes.size() || g_meshes[i].skin < 0)
+		return nullptr;
+	n = g_meshes[i].npts;
+	return g_skin_w.data() + g_skins[(size_t)g_meshes[i].skin].off;
+}
+
+std::vector<float> mesh_skin_pose(int i, const float *local, size_t n_joints, bool normalize, std::string &why) {
+	std::vector<float> out;
+	if (i < 0 || (size_t)i >= g_meshes.size() || g_meshes[i].skin < 0) {
+		why = "mesh " + std::to_string(i) + " is not skinned";
+		return out;
+	}
+	const MeshRec &m = g_meshes[i];
+	const SkinRec &k = g_skins[(size_t)m.skin];
+	const SkelRec &s = g_skels[(size_t)k.skel];
+	if (n_joints != s.njoints) {
+		why = std::to_string(n_joints) + " joint transforms for " + std::to_string(s.njoints) + " joints";
+		return out;
+	}
+	VtIntArray parents(s.njoints);
+	for (size_t j = 0; j < s.njoints; ++j)
+		parents[j] = g_skel_parents[s.par_off + j];
+	const UsdSkelTopology topo(parents);
+	std::vector<GfMatrix4d> loc(s.njoints), skel_xf(s.njoints), skin_xf(s.njoints);
+	for (size_t j = 0; j < s.njoints; ++j)
+		loc[j] = matrix_exact12(local + j * 12);
+	if (!UsdSkelConcatJointTransforms(topo, TfSpan<const GfMatrix4d>(loc), TfSpan<GfMatrix4d>(skel_xf))) {
+		why = "the joint transforms do not compose";
+		return out;
+	}
+	for (size_t j = 0; j < s.njoints; ++j)
+		skin_xf[j] = matrix_exact12(&g_skel_bind[s.xf_off + j * 12]).GetInverse() * skel_xf[j];
+	GfMatrix4d geom, world;
+	for (int r = 0; r < 4; ++r)
+		for (int c = 0; c < 4; ++c) {
+			geom[r][c] = k.geom[r * 4 + c];
+			world[r][c] = s.xf[r * 4 + c];
+		}
+	std::vector<GfVec3f> pts(m.npts);
+	for (size_t v = 0; v < m.npts; ++v)
+		pts[v] = GfVec3f(g_points[m.pt_off + v * 3], g_points[m.pt_off + v * 3 + 1], g_points[m.pt_off + v * 3 + 2]);
+	const size_t n = m.npts * (size_t)k.element;
+	std::vector<float> w(g_skin_w.begin() + (long)k.off, g_skin_w.begin() + (long)(k.off + n));
+	if (normalize)
+		UsdSkelNormalizeWeights(TfSpan<float>(w), k.element);
+	if (!UsdSkelSkinPointsLBS(geom, TfSpan<const GfMatrix4d>(skin_xf), TfSpan<const int>(g_skin_idx.data() + k.off, n),
+				TfSpan<const float>(w), k.element, TfSpan<GfVec3f>(pts), true)) {
+		why = "UsdSkelSkinPointsLBS failed";
+		return out;
+	}
+	out.resize(m.npts * 3);
+	for (size_t v = 0; v < m.npts; ++v) {
+		const GfVec3d w = world.Transform(GfVec3d(pts[v]));
+		out[v * 3] = (float)w[0];
+		out[v * 3 + 1] = (float)w[1];
+		out[v * 3 + 2] = (float)w[2];
+	}
+	return out;
 }
 
 const float *mesh_points(int i, size_t &n) {
