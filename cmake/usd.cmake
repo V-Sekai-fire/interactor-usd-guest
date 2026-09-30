@@ -4,6 +4,11 @@
 # branch riscv64-sandbox (v26.05 + the four-file arch port; the checkout at
 # USD_RV64_SRC must be that branch: `git diff df3f6b4` empty). Both targets are
 # skipped when that build is absent.
+get_filename_component(USD_GUEST_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+# The shared headers are a sibling checkout in the manifest layout.
+if(NOT DEFINED GUEST_COMMON_ROOT)
+	get_filename_component(GUEST_COMMON_ROOT "${USD_GUEST_ROOT}/../../2-contract/guest-common" ABSOLUTE)
+endif()
 set(USD_RV64_DIR "C:/b/g0g" CACHE PATH "gates/0g-openusd/build_usd_rv64.sh output")
 set(USD_RV64_SRC "C:/b/usd2605" CACHE PATH "the org's OpenUSD riscv64-sandbox checkout")
 if(NOT EXISTS "${USD_RV64_DIR}/usd/pxr/usd/usdSkel/libusd_usdSkel.a")
@@ -15,8 +20,8 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(_usd_inc ${CMAKE_BINARY_DIR}/usd_probe_gen/usd_resources.inc)
 add_custom_command(OUTPUT ${_usd_inc}
 	COMMAND ${CMAKE_COMMAND} -E env USD_SRC=${USD_RV64_SRC}
-		${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/gates/0g-openusd/gen_resources.py ${USD_RV64_DIR}/usd ${_usd_inc}
-	DEPENDS ${CMAKE_SOURCE_DIR}/gates/0g-openusd/gen_resources.py
+		${Python3_EXECUTABLE} ${USD_GUEST_ROOT}/tools/gen_resources.py ${USD_RV64_DIR}/usd ${_usd_inc}
+	DEPENDS ${USD_GUEST_ROOT}/tools/gen_resources.py
 	COMMENT "Embedding OpenUSD plugInfo.json + generatedSchema.usda")
 
 # Static pxr libraries register TfTypes, file formats and schemas from static
@@ -34,19 +39,19 @@ endforeach()
 # constexpr unique_ptr destructor rejects; the pxr-facing TUs are C++17 as
 # OpenUSD itself is built. The sandbox-API TU (main.cpp) stays at the default.
 function(add_usd_elf name)
-	add_stage_elf(${name} ${ARGN} guest/usd/mem_resolver.cpp ${_usd_inc})
-	target_include_directories(${name} PRIVATE guest/usd ${CMAKE_BINARY_DIR}/usd_probe_gen
+	add_stage_elf(${name} ${ARGN} ${USD_GUEST_ROOT}/guest/usd/mem_resolver.cpp ${_usd_inc})
+	target_include_directories(${name} PRIVATE ${USD_GUEST_ROOT}/guest/usd ${GUEST_COMMON_ROOT}/guest ${CMAKE_BINARY_DIR}/usd_probe_gen
 		${USD_RV64_DIR}/usd/include ${USD_RV64_DIR}/inst/include)
 	target_compile_definitions(${name} PRIVATE PXR_STATIC=1 MFB_PACKAGE_NAME=usdProbe MFB_ALT_PACKAGE_NAME=usdProbe
 		TBB_USE_EXCEPTIONS=1)
 	target_link_libraries(${name} PRIVATE -Wl,--whole-archive ${_usd_libs} -Wl,--no-whole-archive
 		${USD_RV64_DIR}/inst/lib/libtbb.a -lpthread -ldl)
 endfunction()
-set_source_files_properties(guest/usd/mem_resolver.cpp guest/usd/usd_core.cpp guest/usd_probe/usd_probe_core.cpp
+set_source_files_properties(${USD_GUEST_ROOT}/guest/usd/mem_resolver.cpp ${USD_GUEST_ROOT}/guest/usd/usd_core.cpp ${USD_GUEST_ROOT}/guest/usd_probe/usd_probe_core.cpp
 	PROPERTIES COMPILE_OPTIONS "-std=gnu++17")
 
 # Gate 0G: the probe (counts + checksum of a layer from bytes).
-add_usd_elf(usd_probe guest/usd_probe/main.cpp guest/usd_probe/usd_probe_core.cpp)
-target_include_directories(usd_probe PRIVATE guest/usd_probe)
+add_usd_elf(usd_probe ${USD_GUEST_ROOT}/guest/usd_probe/main.cpp ${USD_GUEST_ROOT}/guest/usd_probe/usd_probe_core.cpp)
+target_include_directories(usd_probe PRIVATE ${USD_GUEST_ROOT}/guest/usd_probe)
 # Cut U: the stage (a .usdz package -> mesh and material arrays).
-add_usd_elf(usd guest/usd/main.cpp guest/usd/usd_core.cpp)
+add_usd_elf(usd ${USD_GUEST_ROOT}/guest/usd/main.cpp ${USD_GUEST_ROOT}/guest/usd/usd_core.cpp)

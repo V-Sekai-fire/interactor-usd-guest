@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-#include "../common/blake3.h"
+#include "common/blake3.h"
 #include "usd_core.h"
 
 namespace {
