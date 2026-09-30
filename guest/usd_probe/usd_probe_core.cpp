@@ -6,7 +6,7 @@
 #include "usd_probe_core.h"
 
 #include "mem_resolver.h"
-#include "../common/blake3.h"
+#include "common/blake3.h"
 
 #include "pxr/pxr.h"
 #include "pxr/base/tf/errorMark.h"
