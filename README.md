@@ -12,4 +12,4 @@ OpenUSD compiled into a RISC-V sandbox guest that opens a stage from bytes, with
 
 ## Licence
 
-Not stated. The repository has no LICENSE file and its sources carry no licence header.
+MIT. See [LICENSE](LICENSE).
