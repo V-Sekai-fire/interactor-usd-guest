@@ -58,6 +58,8 @@
 #include "pxr/usd/usdSkel/animQuery.h"
 #include "pxr/usd/usdSkel/animation.h"
 #include "pxr/usd/usdSkel/binding.h"
+#include "pxr/usd/usdSkel/blendShape.h"
+#include "pxr/usd/usdSkel/inbetweenShape.h"
 #include "pxr/usd/usdSkel/bindingAPI.h"
 #include "pxr/usd/usdSkel/cache.h"
 #include "pxr/usd/usdSkel/root.h"
@@ -98,6 +100,21 @@ struct MeshRec {
 	int skin = -1; // into g_skins
 	bool double_sided = false;
 	size_t surf_off = 0, nsurf = 0; // into g_surfaces, 3 ints a surface
+	size_t shape_first = 0, nshapes = 0; // into g_shapes
+};
+
+// One blend-shape target of a mesh, densified to one offset per vertex of the
+// mesh's point table (interactor-flow MeshConverter.h's rule: a sparse target's
+// pointIndices scatter into zeros). An in-between is its own record, with
+// `primary` naming the target it belongs to and `position` its weight (0, 1);
+// a primary target has primary -1 and position 1.
+struct ShapeRec {
+	Span name;
+	int mesh = -1, primary = -1;
+	float position = 1.0f;
+	bool has_normals = false;
+	size_t off = 0, nrm_off = 0; // into g_shape_off / g_shape_nrm, 3 floats a vertex
+	Span b3;
 };
 
 struct SkelRec {
@@ -156,12 +173,14 @@ std::vector<TexRec> g_texs;
 // blob, parent-local transforms per time sample in g_animxf (12 floats a
 // joint: row-major 3x3 with column-vector convention, then the translation).
 struct AnimRec {
-	Span path, joints;
+	Span path, joints, shapes;
 	size_t xf_off = 0, frames = 0, njoints = 0;
+	size_t bw_off = 0, nshapes = 0; // into g_anim_bw, nshapes floats a frame
 	double fps = 0.0;
+	Span times; // the time codes, one per frame, as text lines
 };
 std::vector<AnimRec> g_anims;
-std::vector<float> g_animxf;
+std::vector<float> g_animxf, g_anim_bw;
 std::vector<SkelRec> g_skels;
 std::vector<int32_t> g_skel_parents;
 std::vector<float> g_skel_bind, g_skel_rest;
@@ -169,6 +188,8 @@ std::map<std::string, int> g_skel_by_path;
 std::vector<SkinRec> g_skins;
 std::vector<int32_t> g_skin_idx;
 std::vector<float> g_skin_w;
+std::vector<ShapeRec> g_shapes;
+std::vector<float> g_shape_off, g_shape_nrm;
 std::string g_pkg_path; // the current asset's path in the resolver ("" when closed)
 
 Span intern(const std::string &s) {
@@ -405,6 +426,100 @@ std::string add_skin(const SkinSrc &src, size_t usd_points, const VtIntArray &fv
 	return "";
 }
 
+// The mesh's skel:blendShapes / skel:blendShapeTargets (UsdSkelBindingAPI), one
+// record per target and one per authored in-between, each densified per vertex
+// of the point table (a faceVarying mesh repeats a point's offset per corner).
+// A target with pointIndices out of range, or offsets that do not match them,
+// is refused; so is a binding whose names and targets differ in count.
+std::string add_blend_shapes(const UsdPrim &prim, size_t usd_points, const VtIntArray &fvi, MeshRec &r) {
+	r.shape_first = g_shapes.size();
+	UsdSkelBindingAPI binding(prim);
+	VtTokenArray names;
+	SdfPathVector targets;
+	if (!binding.GetBlendShapesAttr().Get(&names) || names.empty())
+		return "";
+	binding.GetBlendShapeTargetsRel().GetTargets(&targets);
+	if (targets.size() != names.size())
+		return "skel:blendShapes has " + std::to_string(names.size()) + " names and skel:blendShapeTargets " +
+				std::to_string(targets.size()) + " targets";
+	const UsdStageWeakPtr stage = prim.GetStage();
+	auto densify = [&](const VtVec3fArray &vals, const VtIntArray &pi, std::vector<float> &dst, size_t &off,
+						   const std::string &what) -> std::string {
+		std::vector<float> per_point(usd_points * 3, 0.0f);
+		if (pi.empty()) {
+			if (vals.size() != usd_points)
+				return what + ": " + std::to_string(vals.size()) + " values for " + std::to_string(usd_points) + " points";
+			for (size_t p = 0; p < usd_points; ++p)
+				for (int c = 0; c < 3; ++c)
+					per_point[p * 3 + c] = vals[p][c];
+		} else {
+			if (vals.size() != pi.size())
+				return what + ": " + std::to_string(vals.size()) + " values for " + std::to_string(pi.size()) + " pointIndices";
+			for (size_t k = 0; k < pi.size(); ++k) {
+				if (pi[k] < 0 || (size_t)pi[k] >= usd_points)
+					return what + ": pointIndices entry " + std::to_string(pi[k]) + " out of range";
+				for (int c = 0; c < 3; ++c)
+					per_point[(size_t)pi[k] * 3 + c] = vals[k][c];
+			}
+		}
+		off = dst.size();
+		dst.resize(off + r.npts * 3);
+		for (size_t v = 0; v < r.npts; ++v) {
+			const size_t p = r.indexed ? v : (size_t)fvi[v];
+			for (int c = 0; c < 3; ++c)
+				dst[off + v * 3 + c] = per_point[p * 3 + c];
+		}
+		return "";
+	};
+	for (size_t b = 0; b < names.size(); ++b) {
+		UsdSkelBlendShape bs(stage->GetPrimAtPath(targets[b]));
+		if (!bs)
+			return "blend shape target " + targets[b].GetString() + " is not a BlendShape";
+		VtVec3fArray offsets, normals;
+		VtIntArray pi;
+		bs.GetOffsetsAttr().Get(&offsets);
+		bs.GetNormalOffsetsAttr().Get(&normals);
+		bs.GetPointIndicesAttr().Get(&pi);
+		auto add = [&](const std::string &name, int primary, float position, const VtVec3fArray &o,
+					   const VtVec3fArray &n) -> std::string {
+			ShapeRec k;
+			k.name = intern(name);
+			k.mesh = (int)g_meshes.size();
+			k.primary = primary;
+			k.position = position;
+			std::string e = densify(o, pi, g_shape_off, k.off, name + " offsets");
+			if (!e.empty())
+				return e;
+			k.has_normals = !n.empty();
+			if (k.has_normals) {
+				e = densify(n, pi, g_shape_nrm, k.nrm_off, name + " normalOffsets");
+				if (!e.empty())
+					return e;
+			}
+			k.b3 = intern(blake3::hex(g_shape_off.data() + k.off, r.npts * 3 * sizeof(float)));
+			g_shapes.push_back(k);
+			return "";
+		};
+		const int primary = (int)g_shapes.size();
+		std::string e = add(names[b].GetString(), -1, 1.0f, offsets, normals);
+		if (!e.empty())
+			return e;
+		for (const UsdSkelInbetweenShape &ib : bs.GetAuthoredInbetweens()) {
+			float position = 0.0f;
+			if (!ib.GetWeight(&position) || !(position > 0.0f) || !(position < 1.0f))
+				continue; // the schema allows other weights; Godot's in-between bake needs (0, 1)
+			VtVec3fArray io, in;
+			ib.GetOffsets(&io);
+			ib.GetNormalOffsets(&in);
+			e = add(names[b].GetString() + ":" + ib.GetAttr().GetBaseName().GetString(), primary, position, io, in);
+			if (!e.empty())
+				return e;
+		}
+	}
+	r.nshapes = g_shapes.size() - r.shape_first;
+	return "";
+}
+
 std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::string &layer_path, const SkinSrc *skin,
 		std::string &warn) {
 	UsdGeomMesh mesh(prim);
@@ -585,6 +700,11 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 			return err;
 	}
 
+	if (prim.HasAPI<UsdSkelBindingAPI>()) {
+		const std::string err = add_blend_shapes(prim, pts.size(), fvi, r);
+		if (!err.empty())
+			return err;
+	}
 	r.material = group_mat[0];
 	g_meshes.push_back(r);
 	return "";
@@ -755,9 +875,16 @@ std::string add_anim(const UsdPrim &prim, double fps) {
 	UsdSkelAnimQuery q = cache.GetAnimQuery(prim);
 	if (!q)
 		return "no anim query";
-	std::vector<double> times;
+	// Frames are the union of the joint and the blend-shape-weight time samples
+	// (interactor-flow AnimationConverter.h): a face clip may animate weights only.
+	std::vector<double> times, bw_times;
 	q.GetJointTransformTimeSamples(&times);
+	q.GetBlendShapeWeightTimeSamples(&bw_times);
+	times.insert(times.end(), bw_times.begin(), bw_times.end());
+	std::sort(times.begin(), times.end());
+	times.erase(std::unique(times.begin(), times.end()), times.end());
 	const VtTokenArray joints = q.GetJointOrder();
+	const VtTokenArray shapes = q.GetBlendShapeOrder();
 	AnimRec r;
 	r.path = intern(prim.GetPath().GetString());
 	std::string jl;
@@ -765,11 +892,25 @@ std::string add_anim(const UsdPrim &prim, double fps) {
 		jl += t.GetString() + "\n";
 	r.joints = intern(jl);
 	r.njoints = joints.size();
+	std::string sl, tl;
+	for (const TfToken &t : shapes)
+		sl += t.GetString() + "\n";
+	r.shapes = intern(sl);
+	r.nshapes = shapes.size();
 	r.fps = fps;
 	r.xf_off = g_animxf.size();
+	r.bw_off = g_anim_bw.size();
 	for (double t : times) {
+		tl += TfStringify(t) + "\n";
+		if (!shapes.empty()) {
+			VtFloatArray w;
+			if (!q.ComputeBlendShapeWeights(&w, UsdTimeCode(t)) || w.size() != shapes.size())
+				return "blend shape weights for " + std::to_string(w.size()) + " of " + std::to_string(shapes.size()) +
+						" shapes at time " + std::to_string(t);
+			g_anim_bw.insert(g_anim_bw.end(), w.begin(), w.end());
+		}
 		VtMatrix4dArray xf;
-		if (!q.ComputeJointLocalTransforms(&xf, UsdTimeCode(t)))
+		if (!joints.empty() && !q.ComputeJointLocalTransforms(&xf, UsdTimeCode(t)))
 			return "ComputeJointLocalTransforms failed at time " + std::to_string(t);
 		if (xf.size() != joints.size())
 			return "transforms for " + std::to_string(xf.size()) + " of " + std::to_string(joints.size()) + " joints";
@@ -779,6 +920,7 @@ std::string add_anim(const UsdPrim &prim, double fps) {
 			matrix_to12(xf[j], &g_animxf[at + j * 12]);
 		++r.frames;
 	}
+	r.times = intern(tl);
 	g_anims.push_back(r);
 	return "";
 }
@@ -796,6 +938,10 @@ void clear_tables() {
 	g_curves.clear();
 	g_anims.clear();
 	std::vector<float>().swap(g_animxf);
+	std::vector<float>().swap(g_anim_bw);
+	g_shapes.clear();
+	std::vector<float>().swap(g_shape_off);
+	std::vector<float>().swap(g_shape_nrm);
 	g_skels.clear();
 	g_skel_by_path.clear();
 	g_skins.clear();
@@ -942,9 +1088,9 @@ std::string open(const std::string &bytes) {
 		return s;
 	}
 	char buf[360];
-	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu curves=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu anims=%zu skels=%zu skins=%zu skins_unbound=%zu textures_missing=%zu",
+	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu curves=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu anims=%zu skels=%zu skins=%zu skins_unbound=%zu textures_missing=%zu blend_shapes=%zu",
 			ext, prims, g_meshes.size(), g_curves.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, bytes.size(), g_anims.size(),
-			g_skels.size(), g_skins.size(), skins_unbound, g_tex_missing.size());
+			g_skels.size(), g_skins.size(), skins_unbound, g_tex_missing.size(), g_shapes.size());
 	std::string out = buf;
 	if (!g_tex_missing.empty())
 		out += " missing=" + TfStringJoin(g_tex_missing, ",");
@@ -986,7 +1132,41 @@ bool mesh_info(int i, MeshInfo &out) {
 	out.skeleton = r.skin < 0 ? -1 : g_skins[(size_t)r.skin].skel;
 	out.double_sided = r.double_sided;
 	out.surfaces.assign(g_surfaces.begin() + (long)r.surf_off, g_surfaces.begin() + (long)(r.surf_off + 3 * r.nsurf));
+	out.shape_first = (int)r.shape_first;
+	out.shapes = (int)r.nshapes;
 	return true;
+}
+
+int blend_shape_count() { return (int)g_shapes.size(); }
+
+bool blend_shape_info(int k, BlendShapeInfo &out) {
+	if (k < 0 || (size_t)k >= g_shapes.size())
+		return false;
+	const ShapeRec &r = g_shapes[(size_t)k];
+	out.name = str(r.name);
+	out.mesh = r.mesh;
+	out.primary = r.primary;
+	out.position = r.position;
+	out.has_normals = r.has_normals;
+	out.points = g_meshes[(size_t)r.mesh].npts;
+	out.blake3_offsets = str(r.b3);
+	return true;
+}
+
+const float *blend_shape_offsets(int k, size_t &n_points) {
+	n_points = 0;
+	if (k < 0 || (size_t)k >= g_shapes.size())
+		return nullptr;
+	n_points = g_meshes[(size_t)g_shapes[(size_t)k].mesh].npts;
+	return g_shape_off.data() + g_shapes[(size_t)k].off;
+}
+
+const float *blend_shape_normals(int k, size_t &n_points) {
+	n_points = 0;
+	if (k < 0 || (size_t)k >= g_shapes.size() || !g_shapes[(size_t)k].has_normals)
+		return nullptr;
+	n_points = g_meshes[(size_t)g_shapes[(size_t)k].mesh].npts;
+	return g_shape_nrm.data() + g_shapes[(size_t)k].nrm_off;
 }
 
 int skeleton_count() { return (int)g_skels.size(); }
@@ -1274,7 +1454,19 @@ bool skel_anim_info(int i, SkelAnimInfo &out) {
 	out.frames = r.frames;
 	out.njoints = r.njoints;
 	out.fps = r.fps;
+	out.shapes = str(r.shapes);
+	out.nshapes = r.nshapes;
+	out.times = str(r.times);
 	return true;
+}
+
+const float *skel_anim_blend_weights(int i, size_t &n_floats) {
+	n_floats = 0;
+	if (i < 0 || (size_t)i >= g_anims.size())
+		return nullptr;
+	n_floats = g_anims[i].frames * g_anims[i].nshapes;
+	static const float none = 0.0f; // a clip without weights answers an empty array, not "no animation"
+	return n_floats ? g_anim_bw.data() + g_anims[i].bw_off : &none;
 }
 
 const float *skel_anim_transforms(int i, size_t &n_floats) {
