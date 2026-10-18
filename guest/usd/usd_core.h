@@ -47,6 +47,8 @@ struct MeshInfo {
 	// (material, first triangle, triangles) per run of a materialBind GeomSubset's faces;
 	// empty when the mesh has none and every triangle takes `material`.
 	std::vector<int32_t> surfaces;
+	// The mesh's blend shapes: records [shape_first, shape_first + shapes) of the blend-shape table.
+	int shape_first = 0, shapes = 0;
 };
 bool mesh_info(int i, MeshInfo &out);
 // Views into the flat tables; n is the element count (points / triangles).
@@ -90,9 +92,14 @@ struct SkelAnimInfo {
 	std::string joints; // one joint path per line
 	size_t frames = 0, njoints = 0;
 	double fps = 0.0; // the stage's timeCodesPerSecond
+	std::string shapes; // the clip's blendShapes order, one name per line
+	size_t nshapes = 0;
+	std::string times; // the frames' time codes, one per line (joint and weight samples, merged)
 };
 bool skel_anim_info(int i, SkelAnimInfo &out);
 const float *skel_anim_transforms(int i, size_t &n_floats);
+// frames x nshapes blend-shape weights, in the clip's blendShapes order.
+const float *skel_anim_blend_weights(int i, size_t &n_floats);
 // A new layer holding one motion clip: /Clip (a SkelRoot; upAxis Y,
 // metersPerUnit 1, timeCodesPerSecond = fps, time codes 0 .. frames-1) with
 // /Clip/Skeleton (every joint: joints are the names made valid identifiers
@@ -138,6 +145,26 @@ struct SkinInfo {
 	std::string blake3_indices, blake3_weights;
 };
 bool mesh_skin(int i, SkinInfo &out);
+
+// Blend shapes (UsdSkelBlendShape targets bound by skel:blendShapeTargets), all
+// meshes' in one table, a mesh's records contiguous (MeshInfo::shape_first).
+// Offsets (and normal offsets, when authored) are dense: 3 floats per vertex of
+// the mesh's point table. An in-between is its own record: primary is the
+// index of its target's record and position its weight in (0, 1); a target
+// has primary -1, position 1. Names are the skel:blendShapes entry, and an
+// in-between's is "<name>:<inbetween>".
+int blend_shape_count();
+struct BlendShapeInfo {
+	std::string name;
+	int mesh = -1, primary = -1;
+	float position = 1.0f;
+	bool has_normals = false;
+	size_t points = 0;
+	std::string blake3_offsets;
+};
+bool blend_shape_info(int k, BlendShapeInfo &out);
+const float *blend_shape_offsets(int k, size_t &n_points);
+const float *blend_shape_normals(int k, size_t &n_points);
 const int32_t *mesh_skin_indices(int i, size_t &n_points);
 const float *mesh_skin_weights(int i, size_t &n_points);
 // OpenUSD's own linear blend skinning of mesh i with joint-local transforms

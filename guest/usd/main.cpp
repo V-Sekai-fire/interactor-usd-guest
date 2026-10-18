@@ -170,6 +170,8 @@ static Variant usd_mesh_info(int i) {
 		d["skeleton"] = Variant(m.skeleton);
 		d["double_sided"] = Variant(m.double_sided);
 		d["surfaces"] = Variant(PackedArray<int32_t>(m.surfaces));
+		d["shape_first"] = Variant(m.shape_first);
+		d["shapes"] = Variant(m.shapes);
 		return Variant(d);
 	});
 }
@@ -404,6 +406,9 @@ static Variant usd_skel_anim_info(int i) {
 		d["frames"] = Variant((int64_t)a.frames);
 		d["njoints"] = Variant((int64_t)a.njoints);
 		d["fps"] = Variant(a.fps);
+		d["blend_shapes"] = text(a.shapes);
+		d["nshapes"] = Variant((int64_t)a.nshapes);
+		d["times"] = text(a.times);
 		return Variant(d);
 	});
 }
@@ -417,6 +422,53 @@ static Variant usd_skel_anim_transforms(int i) {
 		return fail("usd_skel_anim_transforms: past the 16 MiB view");
 	return Variant(PackedArray<float>(p, n));
 }
+static Variant usd_skel_anim_blend_weights(int i) {
+	size_t n = 0;
+	const float *p = usdg::skel_anim_blend_weights(i, n);
+	if (!p)
+		return fail("usd_skel_anim_blend_weights: no animation " + std::to_string(i));
+	if (n * sizeof(float) > kWholeLimit)
+		return fail("usd_skel_anim_blend_weights: past the 16 MiB view");
+	return Variant(PackedArray<float>(p, n));
+}
+
+static Variant usd_blend_shape_count() {
+	return Variant(usdg::blend_shape_count());
+}
+
+static Variant usd_blend_shape_info(int k) {
+	return guarded("usd_blend_shape_info", [&] {
+		usdg::BlendShapeInfo b;
+		if (!usdg::blend_shape_info(k, b))
+			return fail("usd_blend_shape_info: no blend shape " + std::to_string(k) + " (count " + std::to_string(usdg::blend_shape_count()) + ")");
+		Dictionary d = Dictionary::Create();
+		d["name"] = text(b.name);
+		d["mesh"] = Variant(b.mesh);
+		d["primary"] = Variant(b.primary);
+		d["position"] = Variant((double)b.position);
+		d["has_normals"] = Variant(b.has_normals);
+		d["points"] = Variant((int64_t)b.points);
+		d["blake3_offsets"] = text(b.blake3_offsets);
+		return Variant(d);
+	});
+}
+
+static Variant usd_blend_shape_offsets_slice(int k, int from, int count) {
+	return guarded("usd_blend_shape_offsets_slice", [&] {
+		size_t n = 0;
+		const float *p = usdg::blend_shape_offsets(k, n);
+		return float_slice("usd_blend_shape_offsets_slice", p, n, 3, from, count);
+	});
+}
+
+static Variant usd_blend_shape_normals_slice(int k, int from, int count) {
+	return guarded("usd_blend_shape_normals_slice", [&] {
+		size_t n = 0;
+		const float *p = usdg::blend_shape_normals(k, n);
+		return float_slice("usd_blend_shape_normals_slice", p, n, 3, from, count);
+	});
+}
+
 static Variant usd_skeleton_count() {
 	return Variant(usdg::skeleton_count());
 }
@@ -591,7 +643,7 @@ int main() {
 	ADD_API_FUNCTION(usd_mesh_count, "int", "", "UsdGeomMesh prims in the document");
 	ADD_API_FUNCTION(usd_material_count, "int", "", "Bound materials in the document");
 	ADD_API_FUNCTION(usd_texture_count, "int", "", "Textures read out of the package");
-	ADD_API_FUNCTION(usd_mesh_info, "Dictionary", "int i", "path, name, points, triangles, has_normals, has_uvs, indexed, material, blake3_points, blake3_indices, xform, skeleton, double_sided, surfaces (material, first triangle, triangles per GeomSubset)");
+	ADD_API_FUNCTION(usd_mesh_info, "Dictionary", "int i", "path, name, points, triangles, has_normals, has_uvs, indexed, material, blake3_points, blake3_indices, xform, skeleton, double_sided, surfaces (material, first triangle, triangles per GeomSubset), shape_first, shapes (blend-shape records)");
 	ADD_API_FUNCTION(usd_mesh_points, "PackedFloat32Array", "int i", "xyz per point");
 	ADD_API_FUNCTION(usd_mesh_points_slice, "PackedFloat32Array", "int i, int from, int count", "points [from, from+count)");
 	ADD_API_FUNCTION(usd_mesh_normals, "PackedFloat32Array", "int i", "xyz per point (per-point normals)");
@@ -616,8 +668,13 @@ int main() {
 			"String names, PackedInt32Array parents, PackedFloat32Array rests, PackedInt32Array anim_joints, PackedFloat32Array anim_local, float fps, String meta",
 			"A .usda of one UsdSkel motion clip (RFD 2277 A2), or ERR:");
 	ADD_API_FUNCTION(usd_skel_anim_count, "int", "", "UsdSkelAnimation prims in the document");
-	ADD_API_FUNCTION(usd_skel_anim_info, "Dictionary", "int i", "path, joints, frames, njoints, fps");
+	ADD_API_FUNCTION(usd_skel_anim_info, "Dictionary", "int i", "path, joints, frames, njoints, fps, blend_shapes, nshapes, times");
 	ADD_API_FUNCTION(usd_skel_anim_transforms, "PackedFloat32Array", "int i", "frames x joints x 12: parent-local 3x3 (row-major) then translation");
+	ADD_API_FUNCTION(usd_skel_anim_blend_weights, "PackedFloat32Array", "int i", "frames x nshapes blend-shape weights, in the clip's blend_shapes order");
+	ADD_API_FUNCTION(usd_blend_shape_count, "int", "", "blend-shape records (targets and in-betweens) of all meshes");
+	ADD_API_FUNCTION(usd_blend_shape_info, "Dictionary", "int k", "name, mesh, primary, position, has_normals, points, blake3_offsets");
+	ADD_API_FUNCTION(usd_blend_shape_offsets_slice, "PackedFloat32Array", "int k, int from, int count", "offsets of vertices [from, from+count), 3 floats a vertex");
+	ADD_API_FUNCTION(usd_blend_shape_normals_slice, "PackedFloat32Array", "int k, int from, int count", "normal offsets of vertices [from, from+count)");
 	ADD_API_FUNCTION(usd_skeleton_count, "int", "", "UsdSkelSkeleton prims in the document");
 	ADD_API_FUNCTION(usd_skeleton_info, "Dictionary", "int i", "path, joints, names, njoints, parents, animation, rest_from_bind, bind_from_rest, xform");
 	ADD_API_FUNCTION(usd_skeleton_binds, "PackedFloat32Array", "int i", "joints x 12: bindTransforms, 3x3 (row-major) then translation");
