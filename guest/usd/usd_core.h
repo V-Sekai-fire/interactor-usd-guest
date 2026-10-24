@@ -81,7 +81,7 @@ std::string write_curves(const float *points, size_t n_points, const int32_t *co
 		const std::vector<std::string> &names, const std::vector<int32_t> &boundary,
 		const std::vector<std::pair<std::string, std::string>> &meta);
 
-// UsdSkelAnimation prims (RFD 2277 A2's motion clips), in Traverse() order.
+// UsdSkelAnimation prims (RFD66606-2277 A2's motion clips), in Traverse() order.
 // A clip's transforms are, per authored time sample, per animated joint, the
 // parent-local transform UsdSkelAnimQuery composes: 12 floats, the row-major
 // 3x3 in the column-vector convention (rule 11: never a quaternion here; the

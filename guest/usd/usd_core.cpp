@@ -169,7 +169,7 @@ std::vector<CurveRec> g_curves;
 std::vector<std::pair<std::string, std::string>> g_layer_data; // customLayerData, values as text
 std::vector<MatRec> g_mats;
 std::vector<TexRec> g_texs;
-// UsdSkelAnimation prims (motion clips, RFD 2277 A2): joints as one text
+// UsdSkelAnimation prims (motion clips, RFD66606-2277 A2): joints as one text
 // blob, parent-local transforms per time sample in g_animxf (12 floats a
 // joint: row-major 3x3 with column-vector convention, then the translation).
 struct AnimRec {
