@@ -1,0 +1,14 @@
+[workspace]
+name = "interactor-usd-guest"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "win-64"]
+
+# The build tools for usd.elf: clang and lld cross-compile to riscv64 against the sysroot,
+# llvm-tools gives llvm-objdump for the ELF checks.
+[dependencies]
+clang = ">=20"
+clangxx = ">=20"
+lld = ">=20"
+llvm-tools = ">=20"
+cmake = "*"
+ninja = "*"

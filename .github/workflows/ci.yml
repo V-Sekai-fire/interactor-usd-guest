@@ -63,18 +63,17 @@ jobs:
         with:
           otp-version: "27"
           elixir-version: "1.18"
-      - name: Sysroot toolchain (clang and lld from the sysroot checkout's pixi environment)
+      - name: Sysroot toolchain (clang, lld, llvm-tools, cmake and ninja from this repository's pixi environment)
         uses: prefix-dev/setup-pixi@v0.8.14
         with:
-          manifest-path: weft/5-repository/riscv64-sysroot/pixi.toml
+          manifest-path: weft/3-interactor/usd-guest/pixi.toml
           cache: true
       - name: Put the sysroot's clang first and assert it can target riscv64
         run: |
-          echo "${{ github.workspace }}/weft/5-repository/riscv64-sysroot/.pixi/envs/default/bin" >> "$GITHUB_PATH"
-          export PATH="${{ github.workspace }}/weft/5-repository/riscv64-sysroot/.pixi/envs/default/bin:$PATH"
+          echo "${{ github.workspace }}/weft/3-interactor/usd-guest/.pixi/envs/default/bin" >> "$GITHUB_PATH"
+          export PATH="${{ github.workspace }}/weft/3-interactor/usd-guest/.pixi/envs/default/bin:$PATH"
           clang++ --version | head -1
           clang++ --print-targets | grep riscv64
-          sudo -S -p '' apt-get update -q && sudo -S -p '' apt-get install -y -q ninja-build cmake llvm
       - name: Restore the OpenUSD and oneTBB builds
         id: usd-cache
         uses: actions/cache/restore@v4
@@ -84,7 +83,7 @@ jobs:
             ${{ env.OUT }}/inst
             ${{ env.OUT }}/tbb
             ${{ env.OUT }}/usd
-          key: usd-rv64-${{ runner.os }}-${{ hashFiles('weft/3-interactor/usd-guest/tools/build_usd_rv64.exs', 'weft/5-repository/riscv64-sysroot/pixi.lock') }}
+          key: usd-rv64-${{ runner.os }}-${{ hashFiles('weft/3-interactor/usd-guest/tools/build_usd_rv64.exs', 'weft/3-interactor/usd-guest/pixi.lock') }}
       - name: Build usd.elf
         working-directory: weft/3-interactor/usd-guest
         run: elixir tools/build_usd_rv64.exs "${{ github.workspace }}/weft" "$OUT"
@@ -97,10 +96,10 @@ jobs:
             ${{ env.OUT }}/inst
             ${{ env.OUT }}/tbb
             ${{ env.OUT }}/usd
-          key: usd-rv64-${{ runner.os }}-${{ hashFiles('weft/3-interactor/usd-guest/tools/build_usd_rv64.exs', 'weft/5-repository/riscv64-sysroot/pixi.lock') }}
+          key: usd-rv64-${{ runner.os }}-${{ hashFiles('weft/3-interactor/usd-guest/tools/build_usd_rv64.exs', 'weft/3-interactor/usd-guest/pixi.lock') }}
       - name: The ELF is a double-precision riscv64 guest with no build paths in it
         run: |
-          export PATH="${{ github.workspace }}/weft/5-repository/riscv64-sysroot/.pixi/envs/default/bin:$PATH"
+          export PATH="${{ github.workspace }}/weft/3-interactor/usd-guest/.pixi/envs/default/bin:$PATH"
           E=weft/3-interactor/usd-guest/tools/standalone/usd.elf
           file "$E" | grep -q "UCB RISC-V"
           llvm-objdump -s -j .sandbox_variant "$E" | grep -q "SBXV 28000000"
