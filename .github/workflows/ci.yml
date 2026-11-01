@@ -102,7 +102,7 @@ jobs:
           export PATH="${{ github.workspace }}/weft/3-interactor/usd-guest/.pixi/envs/default/bin:$PATH"
           E=weft/3-interactor/usd-guest/tools/standalone/usd.elf
           file "$E" | grep -q "UCB RISC-V"
-          llvm-objdump -s -j .sandbox_variant "$E" | grep -q "SBXV 28000000"
+          llvm-objdump -s -j .sandbox_variant "$E" | grep -q "53425856 28000000"
           test "$(strings "$E" | grep -c "$GITHUB_WORKSPACE")" = 0
           for f in usd_open usd_asset usd_asset_push usd_asset_end usd_open_asset usd_asset_list usd_asset_clear; do
             strings "$E" | grep -qx "$f" || { echo "missing $f"; exit 1; }
