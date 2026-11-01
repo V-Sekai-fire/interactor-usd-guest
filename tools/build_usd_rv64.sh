@@ -29,7 +29,7 @@ fetch() { # url ref dir
 	echo "$3 at $(git -C "$3" rev-parse HEAD)"
 }
 fetch https://github.com/uxlfoundation/oneTBB.git "$TBB_REF" "$OUT/src/oneTBB"
-fetch https://github.com/V-Sekai-fire/OpenUSD-fork.git "$USD_REF" "$OUT/src/usd"
+fetch https://github.com/V-Sekai-fire/repository-openusd.git "$USD_REF" "$OUT/src/usd"
 
 if [ ! -f "$OUT/inst/lib/libtbb.a" ]; then
 	cmake -S "$OUT/src/oneTBB" -B "$OUT/tbb" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$TC" \
