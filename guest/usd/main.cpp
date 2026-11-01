@@ -130,6 +130,52 @@ static Variant usd_open_staged() {
 	});
 }
 
+// Streaming input: one file of a loose document at a time, by the path it is
+// referenced under, then usd_open_asset names the root.
+static Variant usd_asset(String path, PackedArray<uint8_t> bytes) {
+	return guarded("usd_asset", [&] {
+		std::vector<uint8_t> v = bytes.fetch();
+		return text(usdg::asset_put(std::string(path), std::string(v.begin(), v.end())));
+	});
+}
+
+static Variant usd_asset_push(String path, PackedArray<uint8_t> chunk) {
+	return guarded("usd_asset_push", [&] {
+		std::vector<uint8_t> v = chunk.fetch();
+		return text(usdg::asset_push(std::string(path), std::string(v.begin(), v.end())));
+	});
+}
+
+static Variant usd_asset_end(String path) {
+	return guarded("usd_asset_end", [&] { return text(usdg::asset_end(std::string(path))); });
+}
+
+static Variant usd_open_asset(String path) {
+	return guarded("usd_open_asset", [&] {
+		return text(usdg::open_asset(std::string(path)) + " instr=" + std::to_string(instret()));
+	});
+}
+
+static Variant usd_asset_list() {
+	return guarded("usd_asset_list", [] {
+		const std::vector<std::string> v = usdg::asset_list();
+		std::string out;
+		for (size_t i = 0; i < v.size(); ++i) {
+			if (i)
+				out += "\n";
+			out += v[i];
+		}
+		return text(out);
+	});
+}
+
+static Variant usd_asset_clear() {
+	return guarded("usd_asset_clear", [] {
+		usdg::asset_clear();
+		return text("ok");
+	});
+}
+
 static Variant usd_close() {
 	return guarded("usd_close", [] {
 		usdg::close();
@@ -706,6 +752,14 @@ int main() {
 			"Open a .usdz (or USDA/USDC) from bytes; ok layer=.. meshes=N materials=M textures=T .. or ERR:");
 	ADD_API_FUNCTION(usd_push, "String", "PackedByteArray chunk", "Stage a piece of a package above the 16 MiB view");
 	ADD_API_FUNCTION(usd_open_staged, "String", "", "Open the staged pieces as one package");
+	ADD_API_FUNCTION(usd_asset, "String", "String path, PackedByteArray bytes",
+			"Put one file of a loose document (its root layer, a sublayer or a texture) under its path");
+	ADD_API_FUNCTION(usd_asset_push, "String", "String path, PackedByteArray chunk",
+			"Stage a piece of one streamed file above the 16 MiB view");
+	ADD_API_FUNCTION(usd_asset_end, "String", "String path", "Commit a streamed file's staged pieces");
+	ADD_API_FUNCTION(usd_open_asset, "String", "String path", "Open the streamed document whose root layer is this path");
+	ADD_API_FUNCTION(usd_asset_list, "String", "", "The streamed files' paths, one per line");
+	ADD_API_FUNCTION(usd_asset_clear, "String", "", "Drop every streamed file");
 	ADD_API_FUNCTION(usd_close, "String", "", "Drop the document and its tables");
 	ADD_API_FUNCTION(usd_mesh_count, "int", "", "UsdGeomMesh prims in the document");
 	ADD_API_FUNCTION(usd_material_count, "int", "", "Bound materials in the document");

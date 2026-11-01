@@ -7,6 +7,7 @@
 #include "pxr/base/plug/registry.h"
 #include "pxr/base/tf/errorMark.h"
 #include "pxr/base/tf/diagnostic.h"
+#include "pxr/base/tf/pathUtils.h"
 #include "pxr/base/tf/type.h"
 #include "pxr/base/work/threadLimits.h"
 #include "pxr/usd/ar/defineResolver.h"
@@ -58,18 +59,25 @@ public:
 	UsdProbe_MemResolver() = default;
 
 protected:
+	// A relative reference is joined to the anchor's directory and normalized,
+	// so `../textures/x.png` in layers/Materials.usda finds /mem/asset/textures/x.png
+	// (the path the host streamed it under). A package-relative path (with a
+	// '[...]' member) is left alone: Ar splits it before this resolver sees it.
 	std::string _CreateIdentifier(const std::string &assetPath, const ArResolvedPath &anchor) const override {
-		if (assetPath.empty() || assetPath[0] == '/' || anchor.empty())
+		if (assetPath.empty() || assetPath.find('[') != std::string::npos)
 			return assetPath;
+		if (assetPath[0] == '/' || anchor.empty())
+			return TfNormPath(assetPath);
 		std::string a = anchor.GetPathString();
-		return a.substr(0, a.rfind('/') + 1) + assetPath;
+		return TfNormPath(a.substr(0, a.rfind('/') + 1) + assetPath);
 	}
 	std::string _CreateIdentifierForNewAsset(const std::string &assetPath, const ArResolvedPath &anchor) const override {
 		return _CreateIdentifier(assetPath, anchor);
 	}
 	ArResolvedPath _Resolve(const std::string &assetPath) const override {
 		std::lock_guard<std::mutex> lk(g_mu);
-		return g_assets.count(assetPath) ? ArResolvedPath(assetPath) : ArResolvedPath();
+		const std::string p = assetPath.find('[') == std::string::npos ? TfNormPath(assetPath) : assetPath;
+		return g_assets.count(p) ? ArResolvedPath(p) : ArResolvedPath();
 	}
 	ArResolvedPath _ResolveForNewAsset(const std::string &assetPath) const override {
 		return ArResolvedPath(assetPath);

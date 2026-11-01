@@ -30,6 +30,16 @@ std::string init();
 // "ERR: <reason>". A previous document is closed first.
 std::string open(const std::string &bytes);
 void close();
+// Streaming input: put each file of a loose document (its root layer, every
+// sublayer, every texture) by the path it is referenced under, then open the
+// root. A .usdz is one file; a bare .usda is the root of a tree. Nothing has to
+// be bundled first. Files above the host's syscall view are pushed in pieces.
+std::string asset_put(const std::string &rel, const std::string &bytes);
+std::string asset_push(const std::string &rel, const std::string &chunk);
+std::string asset_end(const std::string &rel);
+std::string open_asset(const std::string &rel);
+void asset_clear();
+std::vector<std::string> asset_list();
 // Sizes of the current document's tables (0 when nothing is open).
 int mesh_count();
 int material_count();

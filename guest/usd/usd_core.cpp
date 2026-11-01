@@ -21,6 +21,9 @@
 #include "mem_resolver.h"
 #include "common/blake3.h"
 
+#include <algorithm>
+#include <map>
+
 #include "pxr/pxr.h"
 #include "pxr/base/gf/matrix4d.h"
 #include "pxr/base/gf/vec2f.h"
@@ -191,6 +194,9 @@ std::vector<float> g_skin_w;
 std::vector<ShapeRec> g_shapes;
 std::vector<float> g_shape_off, g_shape_nrm;
 std::string g_pkg_path; // the current asset's path in the resolver ("" when closed)
+bool g_pkg_owned = false; // open() put g_pkg_path itself (close() erases it; a streamed one is the host's)
+std::vector<std::string> g_stream; // paths the host streamed in, erased by asset_clear()
+std::map<std::string, std::string> g_stage; // path -> bytes being pushed, until asset_end()
 
 Span intern(const std::string &s) {
 	Span sp{ g_strings.size(), s.size() };
@@ -974,22 +980,8 @@ std::string init() {
 	return usdmem::init();
 }
 
-std::string open(const std::string &bytes) {
-	close();
-	const std::string init = usdmem::init();
-	if (init.compare(0, 3, "ok ") != 0)
-		return "ERR: init: " + init;
-	if (bytes.empty())
-		return "ERR: empty package";
-	const char *ext = "usda";
-	if (bytes.size() >= 4 && std::memcmp(bytes.data(), "PK\x03\x04", 4) == 0)
-		ext = "usdz";
-	else if (bytes.size() >= 8 && std::memcmp(bytes.data(), "PXR-USDC", 8) == 0)
-		ext = "usdc";
-	static int serial = 0;
-	g_pkg_path = "/mem/pkg" + std::to_string(++serial) + "." + ext;
-	usdmem::put_asset(g_pkg_path, bytes.data(), bytes.size());
-
+// The stage build, once the root layer is in the resolver as g_pkg_path.
+static std::string open_stage(const char *ext, size_t nbytes) {
 	TfErrorMark mark;
 	size_t prims = 0;
 	std::string warn;
@@ -1089,7 +1081,7 @@ std::string open(const std::string &bytes) {
 	}
 	char buf[360];
 	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu curves=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu anims=%zu skels=%zu skins=%zu skins_unbound=%zu textures_missing=%zu blend_shapes=%zu",
-			ext, prims, g_meshes.size(), g_curves.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, bytes.size(), g_anims.size(),
+				ext, prims, g_meshes.size(), g_curves.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, nbytes, g_anims.size(),
 			g_skels.size(), g_skins.size(), skins_unbound, g_tex_missing.size(), g_shapes.size());
 	std::string out = buf;
 	if (!g_tex_missing.empty())
@@ -1101,11 +1093,101 @@ std::string open(const std::string &bytes) {
 	return out;
 }
 
+std::string open(const std::string &bytes) {
+	close();
+	const std::string init = usdmem::init();
+	if (init.compare(0, 3, "ok ") != 0)
+		return "ERR: init: " + init;
+	if (bytes.empty())
+		return "ERR: empty package";
+	const char *ext = "usda";
+	if (bytes.size() >= 4 && std::memcmp(bytes.data(), "PK\x03\x04", 4) == 0)
+		ext = "usdz";
+	else if (bytes.size() >= 8 && std::memcmp(bytes.data(), "PXR-USDC", 8) == 0)
+		ext = "usdc";
+	static int serial = 0;
+	g_pkg_path = "/mem/pkg" + std::to_string(++serial) + "." + ext;
+	g_pkg_owned = true;
+	usdmem::put_asset(g_pkg_path, bytes.data(), bytes.size());
+	return open_stage(ext, bytes.size());
+}
+
+// --- streaming assets ------------------------------------------------------
+//
+// The host streams a loose document (its root layer, every sublayer, every
+// texture) in one file at a time, by the path each is referenced under, then
+// opens the root. Every streamed file lives under /mem/asset/, so a relative
+// reference inside one resolves to the path the host gave it and nothing has
+// to be bundled first. A .usdz is a single streamed file; a bare .usda is the
+// root of a tree.
+
+static std::string asset_full(const std::string &rel) {
+	return "/mem/asset/" + rel;
+}
+
+std::string asset_put(const std::string &rel, const std::string &bytes) {
+	if (rel.empty())
+		return "ERR: asset_put: empty path";
+	usdmem::put_asset(asset_full(rel), bytes.data(), bytes.size());
+	if (std::find(g_stream.begin(), g_stream.end(), rel) == g_stream.end())
+		g_stream.push_back(rel);
+	char buf[96];
+	std::snprintf(buf, sizeof buf, "ok path=%s bytes=%zu", rel.c_str(), bytes.size());
+	return buf;
+}
+
+std::string asset_push(const std::string &rel, const std::string &chunk) {
+	if (rel.empty())
+		return "ERR: asset_push: empty path";
+	std::string &buf = g_stage[rel];
+	buf.append(chunk);
+	char out[128];
+	std::snprintf(out, sizeof out, "staged path=%s bytes=%zu", rel.c_str(), buf.size());
+	return out;
+}
+
+std::string asset_end(const std::string &rel) {
+	std::map<std::string, std::string>::iterator it = g_stage.find(rel);
+	if (it == g_stage.end())
+		return "ERR: asset_end: nothing staged at " + rel;
+	const std::string r = asset_put(rel, it->second);
+	g_stage.erase(it);
+	return r;
+}
+
+std::string open_asset(const std::string &rel) {
+	close();
+	const std::string init = usdmem::init();
+	if (init.compare(0, 3, "ok ") != 0)
+		return "ERR: init: " + init;
+	const std::string full = asset_full(rel);
+	const long n = usdmem::asset_size(full);
+	if (n < 0)
+		return "ERR: no asset at " + rel;
+	const char *ext = "usda";
+	if (rel.size() >= 5 && rel.compare(rel.size() - 5, 5, ".usdz") == 0)
+		ext = "usdz";
+	else if (rel.size() >= 5 && rel.compare(rel.size() - 5, 5, ".usdc") == 0)
+		ext = "usdc";
+	g_pkg_path = full;
+	g_pkg_owned = false;
+	return open_stage(ext, (size_t)n);
+}
+
+void asset_clear() {
+	for (size_t i = 0; i < g_stream.size(); ++i)
+		usdmem::erase_asset(asset_full(g_stream[i]));
+	g_stream.clear();
+	g_stage.clear();
+}
+
+std::vector<std::string> asset_list() { return g_stream; }
+
 void close() {
-	if (!g_pkg_path.empty()) {
+	if (g_pkg_owned && !g_pkg_path.empty())
 		usdmem::erase_asset(g_pkg_path);
-		g_pkg_path.clear();
-	}
+	g_pkg_path.clear();
+	g_pkg_owned = false;
 	clear_tables();
 }
 
