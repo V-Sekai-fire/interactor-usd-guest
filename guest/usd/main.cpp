@@ -359,7 +359,7 @@ static Variant usd_write_curves(PackedArray<float> points, PackedArray<int32_t> 
 }
 
 
-// RFD 2277 A2: one motion clip as a UsdSkel .usda (usdg::write_skel_clip).
+// RFD66606-2277 A2: one motion clip as a UsdSkel .usda (usdg::write_skel_clip).
 // rests: J x 24 floats, each joint's parent-local rest (12) then its world
 // bind (12); anim_local: frames x anim_joints x 12. Names and meta one per line.
 static Variant usd_write_skel_clip(String names, PackedArray<int32_t> parents, PackedArray<float> rests,
