@@ -12,7 +12,7 @@
 set -euo pipefail
 WEFT=$(cd "$1" && pwd); OUT=$(mkdir -p "$2" && cd "$2" && pwd)
 TC="$WEFT/5-repository/riscv64-sysroot/toolchain.cmake"
-USD_REF=df3f6b4abcc888a3b484d9e3a4600723e4c1bb56 # riscv64-sandbox: v26.05 + the four-file arch port
+USD_REF=7b709ed624bed1a25dd20e4a1875595bc77ac7c3 # dev/sdf-text-writer-no-printf: riscv64-sandbox df3f6b4a + attribute values written without printf
 TBB_REF=v2021.12.0
 J=${J:-$(nproc)}
 # Through CFLAGS/CXXFLAGS, not -DCMAKE_CXX_FLAGS: that replaces the toolchain file's
@@ -29,7 +29,7 @@ fetch() { # url ref dir
 	echo "$3 at $(git -C "$3" rev-parse HEAD)"
 }
 fetch https://github.com/uxlfoundation/oneTBB.git "$TBB_REF" "$OUT/src/oneTBB"
-fetch https://github.com/V-Sekai-fire/OpenUSD.git "$USD_REF" "$OUT/src/usd"
+fetch https://github.com/V-Sekai-fire/OpenUSD-fork.git "$USD_REF" "$OUT/src/usd"
 
 if [ ! -f "$OUT/inst/lib/libtbb.a" ]; then
 	cmake -S "$OUT/src/oneTBB" -B "$OUT/tbb" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$TC" \
