@@ -74,7 +74,7 @@ jobs:
           export PATH="${{ github.workspace }}/weft/5-repository/riscv64-sysroot/.pixi/envs/default/bin:$PATH"
           clang++ --version | head -1
           clang++ --print-targets | grep riscv64
-          sudo -S -p '' apt-get update -q && sudo -S -p '' apt-get install -y -q ninja-build cmake
+          sudo -S -p '' apt-get update -q && sudo -S -p '' apt-get install -y -q ninja-build cmake llvm
       - name: Restore the OpenUSD and oneTBB builds
         id: usd-cache
         uses: actions/cache/restore@v4
