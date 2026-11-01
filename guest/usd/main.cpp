@@ -359,6 +359,73 @@ static Variant usd_write_curves(PackedArray<float> points, PackedArray<int32_t> 
 }
 
 
+// One mesh as a .usdz package (usdg::write_mesh): the arrays the usd_mesh_* readers return, written back.
+// The host puts a call's arguments in registers a1..a7, so the call packs into four. header: line 1 is
+// the mesh name, then k=v lines; np, nuv, nrest, nf and ni (counts of points, uv floats, rest floats,
+// faces, corners) size the arrays and every other k=v goes to customLayerData. joints: one "name<TAB>parent"
+// line per joint (parent -1 for a root, parents before children), empty for no skin. floats: points (3 np),
+// uvs (nuv), rests (J x 24: parent-local rest 12 then world bind 12) and skin weights (np x element_size),
+// back to back. ints: face corner counts (nf), corners (ni) and skin indices, back to back.
+static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> ints, String header, String joints) {
+	return guarded("usd_write_mesh", [&] {
+		const std::vector<float> f = floats.fetch();
+		const std::vector<int32_t> n = ints.fetch();
+		std::string name;
+		size_t np = 0, nuv = 0, nrest = 0, nf = 0, ni = 0;
+		std::vector<std::pair<std::string, std::string>> m;
+		for (const std::string &ln : lines_of(header.utf8())) {
+			if (name.empty()) { name = ln; continue; }
+			const size_t eq = ln.find('=');
+			if (eq == std::string::npos)
+				return fail("usd_write_mesh: header line '" + ln + "' has no '='");
+			const std::string k = ln.substr(0, eq);
+			const size_t v = (size_t)std::atoll(ln.c_str() + eq + 1);
+			if (k == "np") np = v;
+			else if (k == "nuv") nuv = v;
+			else if (k == "nrest") nrest = v;
+			else if (k == "nf") nf = v;
+			else if (k == "ni") ni = v;
+			else m.emplace_back(k, ln.substr(eq + 1));
+		}
+		if (f.size() < np * 3 + nuv + nrest || n.size() < nf + ni)
+			return fail("usd_write_mesh: the arrays are shorter than the header sizes");
+		const size_t nw = f.size() - np * 3 - nuv - nrest, nsi = n.size() - nf - ni;
+		const float *pts = f.data(), *uv = pts + np * 3, *rests = uv + nuv, *w = rests + nrest;
+		std::vector<std::string> j;
+		std::vector<int32_t> pa;
+		for (const std::string &ln : lines_of(joints.utf8())) {
+			const size_t tab = ln.find('\t');
+			if (tab == std::string::npos)
+				return fail("usd_write_mesh: joint line '" + ln + "' has no tab and parent");
+			j.push_back(ln.substr(0, tab));
+			pa.push_back(std::atoi(ln.c_str() + tab + 1));
+		}
+		if (nuv != 0 && nuv != np * 2)
+			return fail("usd_write_mesh: " + std::to_string(nuv) + " uv floats for " + std::to_string(np) + " points");
+		std::vector<float> rest, bind;
+		size_t element_size = 0;
+		if (!j.empty()) {
+			if (nrest != j.size() * 24)
+				return fail("usd_write_mesh: rests are not J x 24");
+			if (np == 0 || nw == 0 || nw % np != 0 || nsi != nw)
+				return fail("usd_write_mesh: skin arrays are not points x element_size");
+			element_size = nw / np;
+			for (size_t k = 0; k < j.size(); ++k) {
+				rest.insert(rest.end(), rests + k * 24, rests + k * 24 + 12);
+				bind.insert(bind.end(), rests + k * 24 + 12, rests + k * 24 + 24);
+			}
+		}
+		const std::vector<int32_t> c(n.begin(), n.begin() + nf), ix(n.begin() + nf, n.begin() + nf + ni);
+		const std::string z = usdg::write_mesh(name, pts, np, c, ix, nuv ? uv : nullptr, j, pa, rest.data(), bind.data(),
+				n.data() + nf + ni, w, element_size, m);
+		if (z.compare(0, 5, "ERR: ") == 0)
+			return text(z);
+		if (z.size() > kWholeLimit)
+			return fail("usd_write_mesh: " + std::to_string(z.size()) + " bytes is past the 16 MiB view");
+		return Variant(PackedArray<uint8_t>((const uint8_t *)z.data(), z.size()));
+	});
+}
+
 // RFD66606-2277 A2: one motion clip as a UsdSkel .usda (usdg::write_skel_clip).
 // rests: J x 24 floats, each joint's parent-local rest (12) then its world
 // bind (12); anim_local: frames x anim_joints x 12. Names and meta one per line.
@@ -664,6 +731,9 @@ int main() {
 	ADD_API_FUNCTION(usd_write_curves, "String",
 			"PackedFloat32Array points, PackedInt32Array counts, PackedInt32Array boundary, String names, String meta",
 			"A .usda of linear BasisCurves under /Creation (names and k=v meta one per line), or ERR:");
+	ADD_API_FUNCTION(usd_write_mesh, "PackedByteArray",
+			"PackedFloat32Array floats, PackedInt32Array ints, String header, String joints",
+			"A .usdz package of one mesh with its uvs and skin (four packed arguments: the host has seven registers), or an ERR: String");
 	ADD_API_FUNCTION(usd_write_skel_clip, "String",
 			"String names, PackedInt32Array parents, PackedFloat32Array rests, PackedInt32Array anim_joints, PackedFloat32Array anim_local, float fps, String meta",
 			"A .usda of one UsdSkel motion clip (RFD 2277 A2), or ERR:");

@@ -114,6 +114,22 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 		const float *anim_local, size_t frames, double fps,
 		const std::vector<std::pair<std::string, std::string>> &meta);
 
+// One mesh as a .usdz package (a zip of one .usda member, stored and 64-byte aligned: the host
+// has no streaming, so a mesh crosses as one package, as usd_open takes it). The layer is the
+// writing half of mesh_points / mesh_indices / mesh_uvs /
+// mesh_skin_*: /<name>/<name> is a UsdGeomMesh with `points` (xyz), per-face `counts` and
+// corner `indices`, primvars:st from `uvs` (2 floats a point, vertex interpolation, null for
+// none), and, when `joints` is not empty, a UsdSkelRoot /<name> with /<name>/Skeleton
+// (jointNames as given, joints the names made valid identifiers nested by `parents`, bind and
+// rest as J x 12) and the mesh's skel binding with skin_indices / skin_weights (n_points x
+// element_size). Parents must come before their children, so joint order, and with it every
+// skin index, is kept. `meta` goes in customLayerData. The text is parsed back before it is
+// returned. Returns the .usdz bytes (they begin "PK"), or text beginning "ERR: <reason>".
+std::string write_mesh(const std::string &name, const float *points, size_t n_points, const std::vector<int32_t> &counts,
+		const std::vector<int32_t> &indices, const float *uvs, const std::vector<std::string> &joints,
+		const std::vector<int32_t> &parents, const float *rest_local, const float *bind_world, const int32_t *skin_indices,
+		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta);
+
 // UsdSkelSkeleton prims, in Traverse() order. Joint transforms are 12 floats
 // as the animation table's: bind is each joint's bindTransforms entry, rest its
 // parent-local restTransforms entry (derived from the binds when not authored).

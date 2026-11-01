@@ -1601,4 +1601,186 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 	}
 }
 
+namespace {
+// A .usdz is a zip with stored (uncompressed) members whose data starts on a 64-byte boundary,
+// so the host can map them (UsdZipFileWriter's rule). One member, fixed DOS time 1980-01-01, so
+// the same layer always packs to the same bytes.
+uint32_t crc32_of(const std::string &s) {
+	static uint32_t table[256];
+	static bool made = false;
+	if (!made) {
+		for (uint32_t i = 0; i < 256; ++i) {
+			uint32_t c = i;
+			for (int k = 0; k < 8; ++k)
+				c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+			table[i] = c;
+		}
+		made = true;
+	}
+	uint32_t c = 0xFFFFFFFFu;
+	for (unsigned char b : s)
+		c = table[(c ^ b) & 0xFF] ^ (c >> 8);
+	return c ^ 0xFFFFFFFFu;
+}
+void le16(std::string &o, uint32_t v) { o.push_back(char(v & 0xFF)); o.push_back(char((v >> 8) & 0xFF)); }
+void le32(std::string &o, uint32_t v) { le16(o, v & 0xFFFF); le16(o, v >> 16); }
+} // namespace
+
+std::string usdz_package(const std::string &member, const std::string &data) {
+	const uint32_t crc = crc32_of(data), size = (uint32_t)data.size();
+	// Local header is 30 bytes + name + extra; pad the extra field (id 0x1986, as Pixar's writer) so the data lands on 64.
+	size_t extra = 0;
+	if ((30 + member.size()) % 64 != 0) {
+		extra = 64 - (30 + member.size()) % 64;
+		if (extra < 4)
+			extra += 64;
+	}
+	std::string z;
+	le32(z, 0x04034b50);
+	le16(z, 20); le16(z, 0); le16(z, 0); le16(z, 0); le16(z, 0x21);
+	le32(z, crc); le32(z, size); le32(z, size);
+	le16(z, (uint32_t)member.size()); le16(z, (uint32_t)extra);
+	z += member;
+	if (extra) {
+		le16(z, 0x1986); le16(z, (uint32_t)(extra - 4));
+		z.append(extra - 4, '\0');
+	}
+	z += data;
+	const uint32_t cd = (uint32_t)z.size();
+	le32(z, 0x02014b50);
+	le16(z, 20); le16(z, 20); le16(z, 0); le16(z, 0); le16(z, 0); le16(z, 0x21);
+	le32(z, crc); le32(z, size); le32(z, size);
+	le16(z, (uint32_t)member.size()); le16(z, 0); le16(z, 0); le16(z, 0); le16(z, 0);
+	le32(z, 0); le32(z, 0);
+	z += member;
+	const uint32_t cd_size = (uint32_t)z.size() - cd;
+	le32(z, 0x06054b50);
+	le16(z, 0); le16(z, 0); le16(z, 1); le16(z, 1);
+	le32(z, cd_size); le32(z, cd); le16(z, 0);
+	return z;
+}
+
+std::string write_mesh(const std::string &name, const float *points, size_t n_points, const std::vector<int32_t> &counts,
+		const std::vector<int32_t> &indices, const float *uvs, const std::vector<std::string> &joints,
+		const std::vector<int32_t> &parents, const float *rest_local, const float *bind_world, const int32_t *skin_indices,
+		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta) {
+	const std::string init = usdmem::init();
+	if (init.compare(0, 3, "ok ") != 0)
+		return "ERR: init: " + init;
+	if (!SdfPath::IsValidIdentifier(name))
+		return "ERR: '" + name + "' is not a valid prim name";
+	size_t corners = 0;
+	for (size_t f = 0; f < counts.size(); ++f) {
+		if (counts[f] < 3)
+			return "ERR: face " + std::to_string(f) + " has " + std::to_string(counts[f]) + " corner(s)";
+		corners += (size_t)counts[f];
+	}
+	if (corners != indices.size())
+		return "ERR: counts sum " + std::to_string(corners) + " != indices " + std::to_string(indices.size());
+	for (int32_t i : indices)
+		if (i < 0 || (size_t)i >= n_points)
+			return "ERR: index " + std::to_string(i) + " out of range for " + std::to_string(n_points) + " points";
+	const size_t J = joints.size();
+	const bool skinned = J > 0;
+	if (skinned) {
+		if (parents.size() != J)
+			return "ERR: " + std::to_string(parents.size()) + " parents for " + std::to_string(J) + " joints";
+		for (size_t j = 0; j < J; ++j)
+			if (parents[j] >= (int32_t)j)
+				return "ERR: joint " + std::to_string(j) + " has parent " + std::to_string(parents[j]) +
+						"; parents must come before children, so the skin indices keep their meaning";
+		if (element_size == 0 || !skin_indices || !skin_weights || !rest_local || !bind_world)
+			return "ERR: a skinned mesh needs element_size, skin indices, skin weights, rests and binds";
+	}
+	// Joint paths: each name made a valid identifier, unique among its siblings (as write_skel_clip does);
+	// jointNames carry the names as given. Order is kept, so skin indices need no remapping.
+	std::vector<std::string> path(J);
+	std::map<std::string, int> seen;
+	for (size_t j = 0; j < J; ++j) {
+		const std::string id = TfMakeValidIdentifier(joints[j]);
+		const std::string base = parents[j] < 0 ? id : path[(size_t)parents[j]] + "/" + id;
+		std::string p = base;
+		for (int n = 1; seen.count(p); ++n)
+			p = base + "_" + std::to_string(n);
+		seen[p] = 1;
+		path[j] = p;
+	}
+	TfErrorMark mark;
+	try {
+		UsdStageRefPtr stage = UsdStage::CreateInMemory();
+		UsdGeomSetStageUpAxis(stage, UsdGeomTokens->y);
+		UsdGeomSetStageMetersPerUnit(stage, 1.0);
+		const std::string root_path = "/" + name;
+		VtDictionary cld;
+		for (const std::pair<std::string, std::string> &kv : meta)
+			cld[kv.first] = VtValue(kv.second);
+		stage->GetRootLayer()->SetCustomLayerData(cld);
+		UsdGeomMesh mesh;
+		if (skinned) {
+			UsdSkelRoot root = UsdSkelRoot::Define(stage, SdfPath(root_path));
+			stage->SetDefaultPrim(root.GetPrim());
+			UsdSkelSkeleton skel = UsdSkelSkeleton::Define(stage, SdfPath(root_path + "/Skeleton"));
+			VtTokenArray jt(J), jn(J);
+			VtMatrix4dArray bind(J), rest(J);
+			for (size_t j = 0; j < J; ++j) {
+				jt[j] = TfToken(path[j]);
+				jn[j] = TfToken(joints[j]);
+				bind[j] = matrix_from12(bind_world + j * 12);
+				rest[j] = matrix_from12(rest_local + j * 12);
+			}
+			skel.CreateJointsAttr(VtValue(jt));
+			skel.CreateJointNamesAttr(VtValue(jn));
+			skel.CreateBindTransformsAttr(VtValue(bind));
+			skel.CreateRestTransformsAttr(VtValue(rest));
+			std::string why;
+			UsdSkelTopology topo(jt);
+			if (!topo.Validate(&why))
+				return "ERR: skeleton topology: " + why;
+			mesh = UsdGeomMesh::Define(stage, SdfPath(root_path + "/" + name));
+			UsdSkelBindingAPI bapi = UsdSkelBindingAPI::Apply(mesh.GetPrim());
+			bapi.CreateSkeletonRel().SetTargets({ skel.GetPath() });
+			bapi.CreateJointsAttr(VtValue(jt));
+			VtIntArray si(n_points * element_size);
+			VtFloatArray sw(n_points * element_size);
+			for (size_t k = 0; k < si.size(); ++k) {
+				if (skin_indices[k] < 0 || (size_t)skin_indices[k] >= J)
+					return "ERR: skin index " + std::to_string(skin_indices[k]) + " out of range for " + std::to_string(J) + " joints";
+				si[k] = skin_indices[k];
+				sw[k] = skin_weights[k];
+			}
+			bapi.CreateJointIndicesPrimvar(false, (int)element_size).Set(si);
+			bapi.CreateJointWeightsPrimvar(false, (int)element_size).Set(sw);
+		} else {
+			UsdGeomXform root = UsdGeomXform::Define(stage, SdfPath(root_path));
+			stage->SetDefaultPrim(root.GetPrim());
+			mesh = UsdGeomMesh::Define(stage, SdfPath(root_path + "/" + name));
+		}
+		VtVec3fArray pts(n_points);
+		for (size_t i = 0; i < n_points; ++i)
+			pts[i] = GfVec3f(points[i * 3], points[i * 3 + 1], points[i * 3 + 2]);
+		mesh.CreatePointsAttr(VtValue(pts));
+		mesh.CreateFaceVertexCountsAttr(VtValue(VtIntArray(counts.begin(), counts.end())));
+		mesh.CreateFaceVertexIndicesAttr(VtValue(VtIntArray(indices.begin(), indices.end())));
+		mesh.CreateSubdivisionSchemeAttr(VtValue(UsdGeomTokens->none));
+		if (uvs) {
+			VtVec2fArray st(n_points);
+			for (size_t i = 0; i < n_points; ++i)
+				st[i] = GfVec2f(uvs[i * 2], uvs[i * 2 + 1]);
+			UsdGeomPrimvar pv = UsdGeomPrimvarsAPI(mesh.GetPrim())
+					.CreatePrimvar(TfToken("st"), SdfValueTypeNames->TexCoord2fArray, UsdGeomTokens->vertex);
+			pv.Set(st);
+		}
+		std::string text;
+		if (!stage->GetRootLayer()->ExportToString(&text))
+			return "ERR: export failed: " + first_error(mark);
+		SdfLayerRefPtr check = SdfLayer::CreateAnonymous(".usda");
+		if (!check->ImportFromString(text))
+			return "ERR: the exported text does not parse back (" + std::to_string(text.size()) + " bytes): " +
+					first_error(mark).substr(0, 200);
+		return usdz_package(name + ".usda", text);
+	} catch (const std::exception &e) {
+		return std::string("ERR: write exception: ") + e.what();
+	}
+}
+
 } // namespace usdg
