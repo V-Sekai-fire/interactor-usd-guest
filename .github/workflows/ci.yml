@@ -1,0 +1,154 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+env:
+  GUEST_RUNTIME_SHA: 1d8341825ac6fcfa8b8b2a11ae908e5d6aa71b33
+  GUEST_COMMON_SHA: 1ea61e04bd8e91dfabbf9f36c58de736e5540077
+  SYSROOT_SHA: 8a194b9559c7d2a172b6b392cc3aefe26b94d5e0
+  GODOT_TAG: v20261019-double.2
+  ADDON_TAG: v20261019-addon.1
+
+jobs:
+  fixture:
+    # The loose fixture, read by OpenUSD's own Python API: the answer the guest is checked against.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+      - run: pip install -r tests/requirements.txt
+      - run: python3 tests/check_loose_fixture.py tests/loose
+      - name: Control, a fixture without its texture must fail
+        run: |
+          rm -rf "$RUNNER_TEMP/broken" && cp -R tests/loose "$RUNNER_TEMP/broken" && rm "$RUNNER_TEMP/broken/textures/x.png"
+          ! python3 tests/check_loose_fixture.py "$RUNNER_TEMP/broken"
+
+  build:
+    # usd.elf for riscv64: the sysroot checkout's clang and lld, against guest-runtime's sandbox API.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      OUT: ${{ github.workspace }}/../rv64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: weft/3-interactor/usd-guest
+      - uses: actions/checkout@v4
+        with:
+          repository: V-Sekai-fire/contract-guest-runtime
+          ref: ${{ env.GUEST_RUNTIME_SHA }}
+          path: weft/2-contract/guest-runtime
+      - uses: actions/checkout@v4
+        with:
+          repository: V-Sekai-fire/contract-guest-common
+          ref: ${{ env.GUEST_COMMON_SHA }}
+          path: weft/2-contract/guest-common
+      - uses: actions/checkout@v4
+        with:
+          repository: V-Sekai-fire/repository-riscv64-sysroot
+          ref: ${{ env.SYSROOT_SHA }}
+          path: weft/5-repository/riscv64-sysroot
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+      - name: Sysroot toolchain (clang, lld, llvm-tools, cmake and ninja from this repository's pixi environment)
+        uses: prefix-dev/setup-pixi@v0.8.14
+        with:
+          manifest-path: weft/3-interactor/usd-guest/pixi.toml
+          cache: true
+      - name: Put the sysroot's clang first and assert it can target riscv64
+        run: |
+          echo "${{ github.workspace }}/weft/3-interactor/usd-guest/.pixi/envs/default/bin" >> "$GITHUB_PATH"
+          export PATH="${{ github.workspace }}/weft/3-interactor/usd-guest/.pixi/envs/default/bin:$PATH"
+          clang++ --version | head -1
+          clang++ --print-targets | grep riscv64
+      - name: Restore the OpenUSD and oneTBB builds
+        id: usd-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ env.OUT }}/src
+            ${{ env.OUT }}/inst
+            ${{ env.OUT }}/tbb
+            ${{ env.OUT }}/usd
+          key: usd-rv64-${{ runner.os }}-${{ hashFiles('weft/3-interactor/usd-guest/tools/build_usd_rv64.exs', 'weft/3-interactor/usd-guest/pixi.lock') }}
+      - name: Build usd.elf
+        working-directory: weft/3-interactor/usd-guest
+        run: elixir tools/build_usd_rv64.exs "${{ github.workspace }}/weft" "$OUT"
+      - name: Save the OpenUSD and oneTBB builds
+        if: always() && steps.usd-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.OUT }}/src
+            ${{ env.OUT }}/inst
+            ${{ env.OUT }}/tbb
+            ${{ env.OUT }}/usd
+          key: usd-rv64-${{ runner.os }}-${{ hashFiles('weft/3-interactor/usd-guest/tools/build_usd_rv64.exs', 'weft/3-interactor/usd-guest/pixi.lock') }}
+      - name: The ELF is a double-precision riscv64 guest with no build paths in it
+        run: |
+          export PATH="${{ github.workspace }}/weft/3-interactor/usd-guest/.pixi/envs/default/bin:$PATH"
+          E=weft/3-interactor/usd-guest/tools/standalone/usd.elf
+          file "$E" | grep -q "UCB RISC-V"
+          llvm-objdump -s -j .sandbox_variant "$E" | grep -q "53425856 28000000"
+          test "$(strings "$E" | grep -c "$GITHUB_WORKSPACE")" = 0
+          for f in usd_open usd_asset usd_asset_push usd_asset_end usd_open_asset usd_asset_list usd_asset_clear; do
+            strings "$E" | grep -qx "$f" || { echo "missing $f"; exit 1; }
+          done
+          sha256sum "$E"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usd-elf-${{ github.sha }}
+          path: weft/3-interactor/usd-guest/tools/standalone/usd.elf
+          if-no-files-found: error
+
+  stream:
+    # The ELF in the sandbox host: a loose document streamed in one file at a time.
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          elixir-version: "1.18"
+      - uses: actions/download-artifact@v4
+        with:
+          name: usd-elf-${{ github.sha }}
+          path: elf
+      - name: Restore the Godot editor and the addon
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: godot-host
+          key: godot-host-${{ env.GODOT_TAG }}-${{ env.ADDON_TAG }}
+      - name: Fetch the Godot editor and the addon
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p godot-host
+          gh release download "$GODOT_TAG" -R V-Sekai-fire/service-godot-build -p godot.linuxbsd.editor.double.x86_64 -D godot-host
+          gh release download "$ADDON_TAG" -R V-Sekai-fire/service-godot-build -p libgodot_riscv.linux.template_release.double.x86_64.so -D godot-host
+          chmod +x godot-host/godot.linuxbsd.editor.double.x86_64
+      - run: sudo apt-get update -q && sudo -S -p '' apt-get install -y -q fontconfig fonts-dejavu-core
+      - name: Project holding the addon
+        run: elixir tests/make_project.exs godot-host "$RUNNER_TEMP/proj"
+      - name: Stream the loose document
+        run: elixir tests/run_stream_loose.exs "$PWD/godot-host/godot.linuxbsd.editor.double.x86_64" "$RUNNER_TEMP/proj" "$PWD/elf/usd.elf"
+      - name: Control, a fixture with a missing layer must fail the check
+        run: |
+          rm -rf "$RUNNER_TEMP/broken" && cp -R tests/loose "$RUNNER_TEMP/broken" && rm "$RUNNER_TEMP/broken/layers/Materials.usda"
+          ! LOOSE_DIR="$RUNNER_TEMP/broken" elixir tests/run_stream_loose.exs "$PWD/godot-host/godot.linuxbsd.editor.double.x86_64" "$RUNNER_TEMP/proj" "$PWD/elf/usd.elf"
