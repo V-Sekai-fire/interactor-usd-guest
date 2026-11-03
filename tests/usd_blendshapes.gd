@@ -12,6 +12,11 @@ extends SceneTree
 # Exit code 0 when every check passed.
 
 var fails := 0
+var mem_mb := 1024
+# true: the float and int input of usd_write_mesh goes in pieces through usd_write_input_floats / _ints
+# (a host call carries at most 16 MiB an array) and the header says input=pushed
+var push_input := false
+var alloc_max := 1000000
 var checks := 0
 
 
@@ -31,6 +36,13 @@ func _init() -> void:
 			_clip(elf, out_dir, FileAccess.get_file_as_bytes(a[3]) if a.size() > 3 else PackedByteArray())
 		"body":
 			_body(elf, out_dir, a[3], a[4], int(a[5]) if a.size() > 5 else 12)
+		"big":
+			# every point of every shape listed (dense), 64 frames by default; arg 6 is the sandbox memory in MB
+			if a.size() > 6:
+				mem_mb = int(a[6])
+			_body(elf, out_dir, a[3], a[4], int(a[5]) if a.size() > 5 else 64, true)
+		"slices":
+			_slices(elf, out_dir)
 		_:
 			print("unknown mode ", a[2])
 			fails += 1
@@ -50,9 +62,9 @@ func _ok(label: String, cond: bool, detail: String = "") -> bool:
 
 func _new_sb(elf: PackedByteArray):
 	var sb = ClassDB.instantiate("Sandbox")
-	sb.memory_max = 1024
+	sb.memory_max = mem_mb
 	sb.references_max = 4096
-	sb.allocations_max = 1000000
+	sb.allocations_max = alloc_max
 	sb.execution_timeout = 600000
 	root.add_child(sb)
 	sb.load_buffer(elf)
@@ -86,7 +98,7 @@ func _dense(npts: int, idx: PackedInt32Array, off: PackedFloat32Array) -> Packed
 # clip: {} or {frames, fps, weights: PackedFloat32Array (frames x shapes)}.
 # skin: {} or {joints: String, rests: PackedFloat32Array (J x 24), weights, indices, element}.
 func _write(sb, name: String, pts: PackedFloat32Array, counts: PackedInt32Array, corners: PackedInt32Array,
-		shapes: Array, clip: Dictionary, skin: Dictionary = {}):
+		shapes: Array, clip: Dictionary, skin: Dictionary = {}, fn := "usd_write_mesh", extra := ""):
 	var floats := PackedFloat32Array(pts)
 	var ints := PackedInt32Array(counts)
 	ints.append_array(corners)
@@ -120,11 +132,33 @@ func _write(sb, name: String, pts: PackedFloat32Array, counts: PackedInt32Array,
 		if clip.size() > 0:
 			header += "\nclip_frames=%d\nclip_fps=%s" % [clip["frames"], str(clip["fps"])]
 			floats.append_array(clip["weights"])
-	return sb.vmcall("usd_write_mesh", floats, ints, header, joints)
+	if push_input:
+		var piece := 1024 * 1024
+		for at in range(0, floats.size(), piece):
+			sb.vmcall("usd_write_input_floats", floats.slice(at, at + piece))
+		for at in range(0, ints.size(), piece):
+			sb.vmcall("usd_write_input_ints", ints.slice(at, at + piece))
+		return sb.vmcall(fn, PackedFloat32Array(), PackedInt32Array(), header + extra + "\ninput=pushed", joints)
+	return sb.vmcall(fn, floats, ints, header + extra, joints)
+
+
+# All of the staged write result, through usd_written_slice (8 MiB at a time).
+func _fetch_written(sb) -> PackedByteArray:
+	var total := int(sb.vmcall("usd_written_size"))
+	var out := PackedByteArray()
+	var at := 0
+	while at < total:
+		var part = sb.vmcall("usd_written_slice", at, 8 * 1024 * 1024)
+		if typeof(part) != TYPE_PACKED_BYTE_ARRAY:
+			print("     slice at %d answered %s" % [at, str(part).left(200)])
+			return PackedByteArray()
+		out.append_array(part)
+		at += part.size()
+	return out
 
 
 func _open(sb, pkg: PackedByteArray) -> String:
-	var chunk := 512 * 1024
+	var chunk := 4 * 1024 * 1024
 	var at := 0
 	while at < pkg.size():
 		sb.vmcall("usd_push", pkg.slice(at, min(at + chunk, pkg.size())))
@@ -644,7 +678,7 @@ func _find(n: Node, name: String) -> MeshInstance3D:
 	return null
 
 
-func _body(elf: PackedByteArray, out_dir: String, fbx: String, mesh_name: String, frames: int) -> void:
+func _body(elf: PackedByteArray, out_dir: String, fbx: String, mesh_name: String, frames: int, dense := false) -> void:
 	print("== gates 3 and 5: ", mesh_name, " from ", fbx.get_file())
 	var t0 := Time.get_ticks_msec()
 	var doc := FBXDocument.new()
@@ -696,7 +730,7 @@ func _body(elf: PackedByteArray, out_dir: String, fbx: String, mesh_name: String
 				so.append(ox)
 				so.append(oy)
 				so.append(oz)
-				if so[n0] == 0.0 and so[n0 + 1] == 0.0 and so[n0 + 2] == 0.0:
+				if not dense and so[n0] == 0.0 and so[n0 + 1] == 0.0 and so[n0 + 2] == 0.0:
 					so.resize(n0) # an exact zero offset (as float32) is not listed
 				else:
 					si.append(base + i)
@@ -734,11 +768,27 @@ func _body(elf: PackedByteArray, out_dir: String, fbx: String, mesh_name: String
 
 	var sb = _new_sb(elf)
 	var t1 := Time.get_ticks_msec()
-	var pkg = _write(sb, mesh_name, pts, counts, corners, shapes, {"frames": frames, "fps": 30, "weights": w})
+	var pkg
+	if dense:
+		push_input = true
+		# staged: the package stays in the writer sandbox, comes out in slices, goes into a fresh reader sandbox
+		var sz = _write(sb, mesh_name, pts, counts, corners, shapes, {"frames": frames, "fps": 30, "weights": w}, {}, "usd_write_mesh_staged")
+		if not _ok("staged write answers the size as an int", typeof(sz) == TYPE_INT and sz > 64 * 1024 * 1024, str(sz).left(300)):
+			return
+		pkg = _fetch_written(sb)
+		push_input = false
+		_ok("usd_written_size matches and the slices add up (%d bytes)" % sz, int(sb.vmcall("usd_written_size")) == sz and pkg.size() == sz)
+		sb.vmcall("usd_written_release")
+		_ok("after release the size is 0", int(sb.vmcall("usd_written_size")) == 0)
+		sb.free()
+		sb = _new_sb(elf)
+	else:
+		pkg = _write(sb, mesh_name, pts, counts, corners, shapes, {"frames": frames, "fps": 30, "weights": w})
 	if not _ok("write with shapes and clip: a .usdz comes back", typeof(pkg) == TYPE_PACKED_BYTE_ARRAY and pkg.size() > 2 and pkg[0] == 0x50, str(pkg).left(300)):
 		return
 	print("     write took %d ms; %s.usdz with shapes: %d bytes" % [Time.get_ticks_msec() - t1, mesh_name, pkg.size()])
-	_save(out_dir, mesh_name + "_shapes.usdz", pkg)
+	if not dense:
+		_save(out_dir, mesh_name + "_shapes.usdz", pkg)
 	var t2 := Time.get_ticks_msec()
 	var opened := _open(sb, pkg)
 	print("     open took %d ms: %s" % [Time.get_ticks_msec() - t2, opened.left(200)])
@@ -790,9 +840,107 @@ func _body(elf: PackedByteArray, out_dir: String, fbx: String, mesh_name: String
 	# size (gate 5): the same mesh without shapes
 	var pk0 = _write(sb, mesh_name, pts, counts, corners, [], {})
 	if typeof(pk0) == TYPE_PACKED_BYTE_ARRAY:
-		_save(out_dir, mesh_name + "_plain.usdz", pk0)
+		if not dense:
+			_save(out_dir, mesh_name + "_plain.usdz", pk0)
 		print("SIZE %s: without shapes %d bytes, with %d shapes and a %d-frame clip %d bytes (%.2fx), %d listed points" % [
 				mesh_name, pk0.size(), K, frames, pkg.size(), float(pkg.size()) / float(pk0.size()), listed])
 	else:
 		_ok("write without shapes", false, str(pk0).left(200))
 	sb.queue_free()
+
+
+# ---------------------------------------------------------------- staged results and slices
+
+func _slices(elf: PackedByteArray, out_dir: String) -> void:
+	print("== staged results: usd_written_size / usd_written_slice / usd_written_release")
+	var q := _quad()
+	var pts: PackedFloat32Array = q["pts"]
+	var shapes := [{"name": "lean", "idx": PackedInt32Array([2, 3]), "off": PackedFloat32Array([0, 0, 1, 0, 0, 1])}]
+	var w := PackedFloat32Array([0, 0.5, 1, 0.25])
+	var clip := {"frames": 4, "fps": 24, "weights": w}
+	var sb = _new_sb(elf)
+	# nothing staged yet
+	_ok("slice with nothing staged answers an error String", String(sb.vmcall("usd_written_slice", 0, 10)).begins_with("FAIL"))
+	_ok("usd_written_size is 0 with nothing staged", int(sb.vmcall("usd_written_size")) == 0)
+	# gate 4: the staged path and the whole path write the same bytes
+	var whole = _write(sb, "quad", pts, q["counts"], q["corners"], shapes, clip)
+	var sz = _write(sb, "quad", pts, q["counts"], q["corners"], shapes, clip, {}, "usd_write_mesh_staged")
+	_ok("staged mesh write answers the size as an int", typeof(sz) == TYPE_INT and typeof(whole) == TYPE_PACKED_BYTE_ARRAY and sz == whole.size(), str(sz))
+	var got := _fetch_written(sb)
+	_ok("staged bytes == whole bytes for the same small mesh (%d bytes)" % got.size(), got == whole)
+	# gate 3: slice errors, none of them a crash
+	var n := int(sb.vmcall("usd_written_size"))
+	_ok("slice past the end answers an error String", String(sb.vmcall("usd_written_slice", n, 10)).begins_with("FAIL"))
+	_ok("slice far past the end answers an error String", String(sb.vmcall("usd_written_slice", n + 1000000, 10)).begins_with("FAIL"))
+	_ok("zero-length slice answers an error String", String(sb.vmcall("usd_written_slice", 0, 0)).begins_with("FAIL"))
+	_ok("negative count answers an error String", String(sb.vmcall("usd_written_slice", 0, -5)).begins_with("FAIL"))
+	_ok("negative from answers an error String", String(sb.vmcall("usd_written_slice", -1, 5)).begins_with("FAIL"))
+	var tail = sb.vmcall("usd_written_slice", n - 3, 1000)
+	_ok("a slice that runs past the end is cut to the end", typeof(tail) == TYPE_PACKED_BYTE_ARRAY and tail.size() == 3 and tail == whole.slice(n - 3))
+	var huge = sb.vmcall("usd_written_slice", 0, 1 << 30)
+	_ok("an oversized count is capped (here to the whole %d bytes)" % n, typeof(huge) == TYPE_PACKED_BYTE_ARRAY and huge.size() == n)
+	sb.vmcall("usd_written_release")
+	_ok("slice after release answers an error String", String(sb.vmcall("usd_written_slice", 0, 10)).begins_with("FAIL"))
+	_ok("size after release is 0", int(sb.vmcall("usd_written_size")) == 0)
+	# clip and curves: text results through the same calls
+	var names := PackedStringArray(["root", "arm"])
+	var parents := PackedInt32Array([-1, 0])
+	var rests := PackedFloat32Array([1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0])
+	var aj := PackedInt32Array([0, 1])
+	var al := PackedFloat32Array()
+	for f in 3:
+		for j in 2:
+			al.append_array(PackedFloat32Array([1, 0, 0, 0, 1, 0, 0, 0, 1, float(f), float(j), 0.5]))
+	var t_whole = sb.vmcall("usd_write_skel_clip", "\n".join(names), parents, rests, aj, al, 24.0, "source=t")
+	var t_sz = sb.vmcall("usd_write_skel_clip_staged", "\n".join(names), parents, rests, aj, al, 24.0, "source=t")
+	_ok("clip: staged text == whole text", typeof(t_sz) == TYPE_INT and typeof(t_whole) == TYPE_STRING and _fetch_written(sb) == String(t_whole).to_utf8_buffer())
+	var cp := PackedFloat32Array([0, 0, 0, 1, 0, 0, 1, 1, 0])
+	var c_whole = sb.vmcall("usd_write_curves", cp, PackedInt32Array([3]), PackedInt32Array(), "s0", "source=t")
+	var c_sz = sb.vmcall("usd_write_curves_staged", cp, PackedInt32Array([3]), PackedInt32Array(), "s0", "source=t")
+	_ok("curves: staged text == whole text", typeof(c_sz) == TYPE_INT and typeof(c_whole) == TYPE_STRING and _fetch_written(sb) == String(c_whole).to_utf8_buffer())
+	_ok("an error is an ERR: String from the staged entry too", String(sb.vmcall("usd_write_mesh_staged", PackedFloat32Array(), PackedInt32Array(), "x\nnp=0\nnf=0\nni=0\nnshapes=1", "")).length() > 0 and typeof(sb.vmcall("usd_write_mesh_staged", PackedFloat32Array(), PackedInt32Array(), "x\nnp=0\nnf=0\nni=0\nnshapes=1", "")) == TYPE_STRING)
+	# one array too large for the text form to be parsed back in the sandbox: refused with a message, not a crash
+	var huge_pts := PackedFloat32Array()
+	huge_pts.resize(2100000 * 3)
+	push_input = true
+	var huge_err = _write(sb, "huge", huge_pts, PackedInt32Array([3]), PackedInt32Array([0, 1, 2]), [], {})
+	push_input = false
+	_ok("a single array past 2,000,000 floats answers an ERR: String", typeof(huge_err) == TYPE_STRING and String(huge_err).begins_with("ERR: "), str(huge_err).left(120))
+	# the whole-path call over the view limit: a typed STAGED answer, the same bytes as the staged entry.
+	# 20000 points and 120 shapes that each list every point: arrays of modest size, a package past 15 MiB.
+	var np := 20000
+	var K := 120
+	var big := PackedFloat32Array()
+	big.resize(np * 3)
+	for i in np:
+		big[i * 3] = float(i) * 0.001
+		big[i * 3 + 1] = float(i % 977) * 0.01
+		big[i * 3 + 2] = -float(i % 13)
+	var all_idx := PackedInt32Array()
+	all_idx.resize(np)
+	for i in np:
+		all_idx[i] = i
+	var many := []
+	for k in K:
+		var off := PackedFloat32Array()
+		off.resize(np * 3)
+		for i in np * 3:
+			off[i] = float((i * 7 + k * 13) % 1009) / 1009.0 - 0.25
+		many.append({"name": "s%d" % k, "idx": all_idx, "off": off})
+	push_input = true
+	var corners := PackedInt32Array([0, 1, 2])
+	var r1 = _write(sb, "bigmesh", big, PackedInt32Array([3]), corners, many, {})
+	_ok("whole-path write over the view limit answers a STAGED: String", typeof(r1) == TYPE_STRING and String(r1).begins_with("STAGED: "), str(r1).left(100))
+	var b1 := _fetch_written(sb)
+	var r2 = _write(sb, "bigmesh", big, PackedInt32Array([3]), corners, many, {}, {}, "usd_write_mesh_staged")
+	var b2 := _fetch_written(sb)
+	_ok("... and its bytes equal the staged entry's (%d bytes, past 15 MiB)" % b1.size(), b1.size() > 15 * 1024 * 1024 and b1 == b2 and typeof(r2) == TYPE_INT and r2 == b2.size())
+	push_input = false
+	sb.queue_free()
+	var sb2 = _new_sb(elf)
+	var op := _open(sb2, b1)
+	var rd_ok := op.begins_with("ok ") and int(sb2.vmcall("usd_blend_shape_count")) == K and _same_bits(_read_floats(sb2, "usd_mesh_points", 0), big)
+	for k in [0, K / 2, K - 1]:
+		rd_ok = rd_ok and _same_bits(sb2.vmcall("usd_blend_shape_offsets_slice", k, 0, 0), many[k]["off"])
+	_ok("... and that package opens: points and shapes 0, %d, %d bit for bit" % [K / 2, K - 1], rd_ok, op.left(120))
+	sb2.queue_free()
