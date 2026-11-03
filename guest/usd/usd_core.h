@@ -102,7 +102,8 @@ struct SkelAnimInfo {
 	std::string joints; // one joint path per line
 	size_t frames = 0, njoints = 0;
 	double fps = 0.0; // the stage's timeCodesPerSecond
-	std::string shapes; // the clip's blendShapes order, one name per line
+	std::string shapes; // the clip's blendShapes order, one name per line: originals (customData original_names) when authored
+	std::string tokens; // the same order as authored in blendShapes (valid identifiers)
 	size_t nshapes = 0;
 	std::string times; // the frames' time codes, one per line (joint and weight samples, merged)
 };
@@ -118,11 +119,16 @@ const float *skel_anim_blend_weights(int i, size_t &n_floats);
 // /Clip/Skeleton/Motion (a SkelAnimation of the joints in `anim_joints`,
 // authored through UsdSkelAnimation::SetTransforms from anim_local, frames x
 // anim_joints x 12). rest_local and bind_world are J x 12 in the same layout.
+// With `shapes` not empty the same SkelAnimation also carries blendShapes (the working names of
+// `shapes`, by the blend-shape name rule documented at BlendShapeIn; the originals in customData
+// original_names) and blendShapeWeights.timeSamples at time codes 0 .. frames-1, `weights` being
+// frames x shapes row-major; anim_joints may then be empty (a weights-only clip, `frames` given).
 // Returns the .usda text or "ERR: <reason>".
 std::string write_skel_clip(const std::vector<std::string> &names, const std::vector<int32_t> &parents,
 		const float *rest_local, const float *bind_world, const std::vector<int32_t> &anim_joints,
 		const float *anim_local, size_t frames, double fps,
-		const std::vector<std::pair<std::string, std::string>> &meta);
+		const std::vector<std::pair<std::string, std::string>> &meta,
+		const std::vector<std::string> &shapes = {}, const float *weights = nullptr);
 
 // One mesh as a .usdz package (a zip of one .usda member, stored and 64-byte aligned: the host
 // has no streaming, so a mesh crosses as one package, as usd_open takes it). The layer is the
@@ -135,10 +141,57 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 // element_size). Parents must come before their children, so joint order, and with it every
 // skin index, is kept. `meta` goes in customLayerData. The text is parsed back before it is
 // returned. Returns the .usdz bytes (they begin "PK"), or text beginning "ERR: <reason>".
+//
+// Blend shapes (the writing half of blend_shape_*): each BlendShapeIn becomes a UsdSkelBlendShape
+// child /<name>/<name>/<working name> of the mesh, authored sparse: pointIndices (strictly
+// increasing, inside the point table, at least one) and offsets, plus normalOffsets when `normals`
+// is not null. Nothing is dropped or rounded. A mesh with shapes and no joints is a UsdSkelRoot (an
+// Xform otherwise), so the shapes bind.
+//
+// Names follow the engine's rule (modules/gltf/gltf_document.cpp _gen_unique_name_static, FBX's
+// _gen_unique_name): String::validate_node_name() replaces . : @ / " % with _, then
+// String::validate_ascii_identifier() makes it a USD-valid identifier (empty -> "_", a leading digit
+// gets "_" in front, every other non [A-Za-z0-9_] code point becomes "_"), then the first free one of
+// <s>, <s>2, <s>3 ... (index appended without a separator) is taken. That working name is the prim
+// name, the skel:blendShapes entry and the animation's blendShapes entry, so targets and tracks match.
+// The name as given is kept as customData { string original_name = "..." } on the BlendShape prim
+// (always written) and, for the clip, customData { string[] original_names } on the SkelAnimation.
+//
+// A BlendShapeIn may carry in-betweens (UsdSkelInbetweenShape, inbetweens:<working name> on the
+// BlendShape prim, same working-name rule within the target, original in the attribute's customData
+// original_name). An in-between has the target's pointIndices, so it gives offsets for the same n
+// points (list the union of the points where the target or any in-between is non-zero); `normals`
+// only when it has normal offsets; weight must be in (0, 1).
+//
+// A BlendClipIn adds a SkelAnimation (/<name>/Skeleton/Motion on a skinned mesh, bound by the
+// skeleton's skel:animationSource; /<name>/Motion otherwise, bound by the mesh's) with blendShapes in
+// the targets' order (in-betweens have no track) and blendShapeWeights.timeSamples at time codes
+// 0 .. frames-1, weights frames x targets row-major; the stage's timeCodesPerSecond is fps. The
+// animation carries no joints. Shapes empty and clip null: the output is as before.
+struct InbetweenIn {
+	std::string name;
+	float weight = 0.5f; // in (0, 1)
+	const float *offsets = nullptr; // n x 3, for the target's n points
+	const float *normals = nullptr; // n x 3 or null
+};
+struct BlendShapeIn {
+	std::string name;
+	size_t n = 0; // listed points
+	const int32_t *indices = nullptr; // n point indices
+	const float *offsets = nullptr; // n x 3
+	const float *normals = nullptr; // n x 3 normal offsets, or null
+	std::vector<InbetweenIn> inbetweens;
+};
+struct BlendClipIn {
+	size_t frames = 0;
+	double fps = 0.0;
+	const float *weights = nullptr; // frames x shapes
+};
 std::string write_mesh(const std::string &name, const float *points, size_t n_points, const std::vector<int32_t> &counts,
 		const std::vector<int32_t> &indices, const float *uvs, const std::vector<std::string> &joints,
 		const std::vector<int32_t> &parents, const float *rest_local, const float *bind_world, const int32_t *skin_indices,
-		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta);
+		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta,
+		const std::vector<BlendShapeIn> &shapes = {}, const BlendClipIn *clip = nullptr);
 
 // UsdSkelSkeleton prims, in Traverse() order. Joint transforms are 12 floats
 // as the animation table's: bind is each joint's bindTransforms entry, rest its
@@ -181,7 +234,8 @@ bool mesh_skin(int i, SkinInfo &out);
 // in-between's is "<name>:<inbetween>".
 int blend_shape_count();
 struct BlendShapeInfo {
-	std::string name;
+	std::string name; // the shape's original name when the file keeps one (customData original_name), else the authored token
+	std::string token; // the authored name: the BlendShape prim's skel:blendShapes entry, a valid identifier
 	int mesh = -1, primary = -1;
 	float position = 1.0f;
 	bool has_normals = false;

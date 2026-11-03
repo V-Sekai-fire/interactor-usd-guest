@@ -77,6 +77,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -112,7 +113,7 @@ struct MeshRec {
 // `primary` naming the target it belongs to and `position` its weight (0, 1);
 // a primary target has primary -1 and position 1.
 struct ShapeRec {
-	Span name;
+	Span name, token; // name: original_name when authored; token: the authored (working) name
 	int mesh = -1, primary = -1;
 	float position = 1.0f;
 	bool has_normals = false;
@@ -176,7 +177,7 @@ std::vector<TexRec> g_texs;
 // blob, parent-local transforms per time sample in g_animxf (12 floats a
 // joint: row-major 3x3 with column-vector convention, then the translation).
 struct AnimRec {
-	Span path, joints, shapes;
+	Span path, joints, shapes, tokens; // shapes: original_names when authored; tokens: blendShapes as authored
 	size_t xf_off = 0, frames = 0, njoints = 0;
 	size_t bw_off = 0, nshapes = 0; // into g_anim_bw, nshapes floats a frame
 	double fps = 0.0;
@@ -524,10 +525,17 @@ std::string add_blend_shapes(const UsdPrim &prim, size_t usd_points, const VtInt
 		bs.GetOffsetsAttr().Get(&offsets);
 		bs.GetNormalOffsetsAttr().Get(&normals);
 		bs.GetPointIndicesAttr().Get(&pi);
-		auto add = [&](const std::string &name, int primary, float position, const VtVec3fArray &o,
+		// The authored name is the working token; the writer keeps the original in customData original_name
+		// (on the BlendShape prim, on an in-between's attribute) when it differs.
+		auto original_of = [](const UsdObject &o, const std::string &fallback) {
+			const VtValue v = o.GetCustomDataByKey(TfToken("original_name"));
+			return v.IsHolding<std::string>() ? v.UncheckedGet<std::string>() : fallback;
+		};
+		auto add = [&](const std::string &name, const std::string &token, int primary, float position, const VtVec3fArray &o,
 						   const VtVec3fArray &n) -> std::string {
 			ShapeRec k;
 			k.name = intern(name);
+			k.token = intern(token);
 			k.mesh = (int)g_meshes.size();
 			k.primary = primary;
 			k.position = position;
@@ -547,7 +555,8 @@ std::string add_blend_shapes(const UsdPrim &prim, size_t usd_points, const VtInt
 			return "";
 		};
 		const int primary = (int)g_shapes.size();
-		std::string e = add(names[b].GetString(), -1, 1.0f, offsets, normals);
+		const std::string tok = names[b].GetString(), orig = original_of(bs.GetPrim(), tok);
+		std::string e = add(orig, tok, -1, 1.0f, offsets, normals);
 		if (!e.empty()) {
 			return e;
 		}
@@ -559,7 +568,8 @@ std::string add_blend_shapes(const UsdPrim &prim, size_t usd_points, const VtInt
 			VtVec3fArray io, in;
 			ib.GetOffsets(&io);
 			ib.GetNormalOffsets(&in);
-			e = add(names[b].GetString() + ":" + ib.GetAttr().GetBaseName().GetString(), primary, position, io, in);
+			const std::string itok = ib.GetAttr().GetBaseName().GetString();
+			e = add(orig + ":" + original_of(ib.GetAttr(), itok), tok + ":" + itok, primary, position, io, in);
 			if (!e.empty()) {
 				return e;
 			}
@@ -980,11 +990,20 @@ std::string add_anim(const UsdPrim &prim, double fps) {
 	}
 	r.joints = intern(jl);
 	r.njoints = joints.size();
-	std::string sl, tl;
-	for (const TfToken &t : shapes) {
-		sl += t.GetString() + "\n";
+	std::string sl, tl, tk;
+	// The clip's names are the working tokens; the writer keeps the originals, in track order, in the
+	// animation's customData original_names (used when it has one name per track).
+	VtStringArray originals;
+	const VtValue ov = prim.GetCustomDataByKey(TfToken("original_names"));
+	if (ov.IsHolding<VtStringArray>() && ov.UncheckedGet<VtStringArray>().size() == shapes.size()) {
+		originals = ov.UncheckedGet<VtStringArray>();
+	}
+	for (size_t s = 0; s < shapes.size(); ++s) {
+		tk += shapes[s].GetString() + "\n";
+		sl += (originals.empty() ? shapes[s].GetString() : originals[s]) + "\n";
 	}
 	r.shapes = intern(sl);
+	r.tokens = intern(tk);
 	r.nshapes = shapes.size();
 	r.fps = fps;
 	r.xf_off = g_animxf.size();
@@ -1349,6 +1368,7 @@ bool blend_shape_info(int k, BlendShapeInfo &out) {
 	}
 	const ShapeRec &r = g_shapes[(size_t)k];
 	out.name = str(r.name);
+	out.token = str(r.token);
 	out.mesh = r.mesh;
 	out.primary = r.primary;
 	out.position = r.position;
@@ -1697,6 +1717,7 @@ bool skel_anim_info(int i, SkelAnimInfo &out) {
 	out.njoints = r.njoints;
 	out.fps = r.fps;
 	out.shapes = str(r.shapes);
+	out.tokens = str(r.tokens);
 	out.nshapes = r.nshapes;
 	out.times = str(r.times);
 	return true;
@@ -1721,10 +1742,81 @@ const float *skel_anim_transforms(int i, size_t &n_floats) {
 	return g_animxf.data() + g_anims[i].xf_off;
 }
 
+namespace {
+// The engine's name rule for things that become names, copied from the Godot engine in
+// entities-persona/engine-r4-party:
+//   modules/gltf/gltf_document.cpp GLTFDocument::_gen_unique_name_static (FBXDocument::_gen_unique_name is the
+//   same): s_name = p_name.validate_node_name(); u_name = s_name; the first free of s_name, s_name + itos(2),
+//   s_name + itos(3) ... (no separator) is inserted into the set and returned.
+//   core/string/ustring.cpp String::validate_node_name: each of . : @ / " and % (UNIQUE_NODE_PREFIX) becomes _.
+// USD needs a valid identifier on top of that, so String::validate_ascii_identifier follows: empty is "_", a
+// leading digit gets "_" in front, every other code point that is not [A-Za-z0-9_] becomes one "_".
+std::string engine_validate_node_name(const std::string &s) {
+	std::string r = s;
+	for (char &c : r) {
+		if (c == '.' || c == ':' || c == '@' || c == '/' || c == '"' || c == '%') {
+			c = '_';
+		}
+	}
+	return r;
+}
+std::string engine_validate_ascii_identifier(const std::string &s) {
+	if (s.empty()) {
+		return "_";
+	}
+	std::string r = (s[0] >= '0' && s[0] <= '9') ? "_" : "";
+	for (size_t i = 0; i < s.size();) {
+		const unsigned char c = (unsigned char)s[i];
+		size_t len = 1; // a code point of the UTF-8 text is one character, as in the engine's String
+		if (c >= 0xC0 && c < 0xE0) {
+			len = 2;
+		} else if (c >= 0xE0 && c < 0xF0) {
+			len = 3;
+		} else if (c >= 0xF0 && c < 0xF8) {
+			len = 4;
+		}
+		if (i + len > s.size()) {
+			len = 1;
+		}
+		for (size_t k = 1; k < len; ++k) {
+			if (((unsigned char)s[i + k] & 0xC0) != 0x80) {
+				len = 1;
+				break;
+			}
+		}
+		const bool ident = len == 1 && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_');
+		r += ident ? char(c) : '_';
+		i += len;
+	}
+	return r;
+}
+std::vector<std::string> working_names(const std::vector<std::string> &given) {
+	std::set<std::string> used;
+	std::vector<std::string> out;
+	for (const std::string &g : given) {
+		const std::string s_name = engine_validate_ascii_identifier(engine_validate_node_name(g));
+		std::string u_name;
+		for (int index = 1;; ++index) {
+			u_name = s_name;
+			if (index > 1) {
+				u_name += std::to_string(index);
+			}
+			if (!used.count(u_name)) {
+				break;
+			}
+		}
+		used.insert(u_name);
+		out.push_back(u_name);
+	}
+	return out;
+}
+} // namespace
+
 std::string write_skel_clip(const std::vector<std::string> &names, const std::vector<int32_t> &parents,
 		const float *rest_local, const float *bind_world, const std::vector<int32_t> &anim_joints,
 		const float *anim_local, size_t frames, double fps,
-		const std::vector<std::pair<std::string, std::string>> &meta) {
+		const std::vector<std::pair<std::string, std::string>> &meta,
+		const std::vector<std::string> &shapes, const float *weights) {
 	const std::string init = usdmem::init();
 	if (init.compare(0, 3, "ok ") != 0) {
 		return "ERR: init: " + init;
@@ -1735,6 +1827,12 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 	}
 	if (!(fps > 0.0) || frames == 0) {
 		return "ERR: a clip needs frames and a positive fps";
+	}
+	if (!shapes.empty() && !weights) {
+		return "ERR: blend shapes need weights";
+	}
+	if (anim_joints.empty() && shapes.empty()) {
+		return "ERR: a clip needs animated joints or blend shapes";
 	}
 	for (int32_t a : anim_joints) {
 		if (a < 0 || (size_t)a >= J) {
@@ -1820,13 +1918,34 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 			at[a] = TfToken(path[(size_t)anim_joints[a]]);
 		}
 		anim.CreateJointsAttr(VtValue(at));
-		for (size_t f = 0; f < frames; ++f) {
+		for (size_t f = 0; f < frames && A > 0; ++f) {
 			VtMatrix4dArray xf(A);
 			for (size_t a = 0; a < A; ++a) {
 				xf[a] = matrix_from12(anim_local + (f * A + a) * 12);
 			}
 			if (!anim.SetTransforms(xf, UsdTimeCode(double(f)))) {
 				return "ERR: SetTransforms failed at frame " + std::to_string(f) + ": " + first_error(mark);
+			}
+		}
+		if (!shapes.empty()) {
+			// The same animation drives the shapes: working names (see working_names) in blendShapes, the
+			// names as given in customData original_names, one weight row per frame.
+			const std::vector<std::string> ids = working_names(shapes);
+			VtTokenArray bn(shapes.size());
+			VtStringArray originals(shapes.size());
+			for (size_t s = 0; s < shapes.size(); ++s) {
+				bn[s] = TfToken(ids[s]);
+				originals[s] = shapes[s];
+			}
+			anim.CreateBlendShapesAttr(VtValue(bn));
+			anim.GetPrim().SetCustomDataByKey(TfToken("original_names"), VtValue(originals));
+			UsdAttribute wa = anim.CreateBlendShapeWeightsAttr();
+			const size_t K = shapes.size();
+			for (size_t f = 0; f < frames; ++f) {
+				VtFloatArray w(weights + f * K, weights + (f + 1) * K);
+				if (!wa.Set(w, UsdTimeCode(double(f)))) {
+					return "ERR: blend weights failed at frame " + std::to_string(f) + ": " + first_error(mark);
+				}
 			}
 		}
 		UsdSkelBindingAPI::Apply(skel.GetPrim()).CreateAnimationSourceRel().SetTargets({ anim.GetPath() });
@@ -1959,13 +2078,53 @@ std::string usdz_package(const std::string &member, const std::string &data) {
 std::string write_mesh(const std::string &name, const float *points, size_t n_points, const std::vector<int32_t> &counts,
 		const std::vector<int32_t> &indices, const float *uvs, const std::vector<std::string> &joints,
 		const std::vector<int32_t> &parents, const float *rest_local, const float *bind_world, const int32_t *skin_indices,
-		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta) {
+		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta,
+		const std::vector<BlendShapeIn> &shapes, const BlendClipIn *clip) {
 	const std::string init = usdmem::init();
 	if (init.compare(0, 3, "ok ") != 0) {
 		return "ERR: init: " + init;
 	}
 	if (!SdfPath::IsValidIdentifier(name)) {
 		return "ERR: '" + name + "' is not a valid prim name";
+	}
+	// Blend shapes and the clip: checked before anything is authored.
+	for (size_t s = 0; s < shapes.size(); ++s) {
+		const BlendShapeIn &b = shapes[s];
+		const std::string what = "blend shape " + std::to_string(s) + " '" + b.name + "'";
+		// Any name is allowed, the empty one and repeats included: the working names are made unique.
+		if (b.n == 0) {
+			return "ERR: " + what + " lists no points (list at least one, a zero offset is fine)";
+		}
+		if (!b.indices || !b.offsets) {
+			return "ERR: " + what + " has no indices or offsets";
+		}
+		for (size_t k = 0; k < b.n; ++k) {
+			if (b.indices[k] < 0 || (size_t)b.indices[k] >= n_points) {
+				return "ERR: " + what + " point index " + std::to_string(b.indices[k]) + " out of range for " +
+						std::to_string(n_points) + " points";
+			}
+			if (k > 0 && b.indices[k] <= b.indices[k - 1]) {
+				return "ERR: " + what + " point indices are not strictly increasing at entry " + std::to_string(k);
+			}
+		}
+		for (size_t j = 0; j < b.inbetweens.size(); ++j) {
+			const InbetweenIn &ib = b.inbetweens[j];
+			if (!(ib.weight > 0.0f) || !(ib.weight < 1.0f)) {
+				return "ERR: " + what + " in-between " + std::to_string(j) + " has weight " + std::to_string(ib.weight) +
+						", not inside (0, 1)";
+			}
+			if (!ib.offsets) {
+				return "ERR: " + what + " in-between " + std::to_string(j) + " has no offsets";
+			}
+		}
+	}
+	if (clip) {
+		if (shapes.empty()) {
+			return "ERR: a blend-weight clip needs blend shapes";
+		}
+		if (clip->frames == 0 || !(clip->fps > 0.0) || !clip->weights) {
+			return "ERR: a blend-weight clip needs frames, a positive fps and weights";
+		}
 	}
 	size_t corners = 0;
 	for (size_t f = 0; f < counts.size(); ++f) {
@@ -2017,6 +2176,12 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 		UsdStageRefPtr stage = UsdStage::CreateInMemory();
 		UsdGeomSetStageUpAxis(stage, UsdGeomTokens->y);
 		UsdGeomSetStageMetersPerUnit(stage, 1.0);
+		if (clip) {
+			stage->SetTimeCodesPerSecond(clip->fps);
+			stage->SetFramesPerSecond(clip->fps);
+			stage->SetStartTimeCode(0.0);
+			stage->SetEndTimeCode(double(clip->frames - 1));
+		}
 		const std::string root_path = "/" + name;
 		VtDictionary cld;
 		for (const std::pair<std::string, std::string> &kv : meta) {
@@ -2061,8 +2226,10 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 			bapi.CreateJointIndicesPrimvar(false, (int)element_size).Set(si);
 			bapi.CreateJointWeightsPrimvar(false, (int)element_size).Set(sw);
 		} else {
-			UsdGeomXform root = UsdGeomXform::Define(stage, SdfPath(root_path));
-			stage->SetDefaultPrim(root.GetPrim());
+			// Shapes bind only under a SkelRoot (interactor-flow reads them there).
+			UsdPrim root = shapes.empty() ? UsdGeomXform::Define(stage, SdfPath(root_path)).GetPrim()
+										  : UsdSkelRoot::Define(stage, SdfPath(root_path)).GetPrim();
+			stage->SetDefaultPrim(root);
 			mesh = UsdGeomMesh::Define(stage, SdfPath(root_path + "/" + name));
 		}
 		VtVec3fArray pts(n_points);
@@ -2081,6 +2248,90 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 			UsdGeomPrimvar pv = UsdGeomPrimvarsAPI(mesh.GetPrim())
 										.CreatePrimvar(TfToken("st"), SdfValueTypeNames->TexCoord2fArray, UsdGeomTokens->vertex);
 			pv.Set(st);
+		}
+		if (!shapes.empty()) {
+			// The working names (engine rule, see working_names) are the prim names and the skel:blendShapes
+			// and clip entries; the names as given are kept in customData original_name / original_names.
+			UsdSkelBindingAPI bapi = UsdSkelBindingAPI::Apply(mesh.GetPrim());
+			VtTokenArray bn(shapes.size());
+			VtStringArray originals(shapes.size());
+			SdfPathVector targets;
+			std::vector<std::string> given;
+			for (const BlendShapeIn &b : shapes) {
+				given.push_back(b.name);
+			}
+			const std::vector<std::string> ids = working_names(given);
+			for (size_t s = 0; s < shapes.size(); ++s) {
+				const BlendShapeIn &b = shapes[s];
+				const std::string &id = ids[s];
+				UsdSkelBlendShape bs = UsdSkelBlendShape::Define(stage, mesh.GetPath().AppendChild(TfToken(id)));
+				bs.GetPrim().SetCustomDataByKey(TfToken("original_name"), VtValue(b.name));
+				originals[s] = b.name;
+				if (!b.inbetweens.empty()) {
+					std::vector<std::string> ig;
+					for (const InbetweenIn &ib : b.inbetweens) {
+						ig.push_back(ib.name);
+					}
+					const std::vector<std::string> iw = working_names(ig);
+					for (size_t j = 0; j < b.inbetweens.size(); ++j) {
+						const InbetweenIn &ib = b.inbetweens[j];
+						UsdSkelInbetweenShape shape = bs.CreateInbetween(TfToken(iw[j]));
+						if (!shape) {
+							return "ERR: could not create in-between '" + ib.name + "' of '" + b.name + "': " + first_error(mark);
+						}
+						shape.SetWeight(ib.weight);
+						VtVec3fArray io(b.n), in;
+						for (size_t k = 0; k < b.n; ++k) {
+							io[k] = GfVec3f(ib.offsets[k * 3], ib.offsets[k * 3 + 1], ib.offsets[k * 3 + 2]);
+						}
+						shape.SetOffsets(io);
+						if (ib.normals) {
+							in.resize(b.n);
+							for (size_t k = 0; k < b.n; ++k) {
+								in[k] = GfVec3f(ib.normals[k * 3], ib.normals[k * 3 + 1], ib.normals[k * 3 + 2]);
+							}
+							shape.SetNormalOffsets(in);
+						}
+						shape.GetAttr().SetCustomDataByKey(TfToken("original_name"), VtValue(ib.name));
+					}
+				}
+				VtVec3fArray off(b.n), nrm;
+				VtIntArray pi(b.n);
+				for (size_t k = 0; k < b.n; ++k) {
+					pi[k] = b.indices[k];
+					off[k] = GfVec3f(b.offsets[k * 3], b.offsets[k * 3 + 1], b.offsets[k * 3 + 2]);
+				}
+				bs.CreateOffsetsAttr(VtValue(off));
+				bs.CreatePointIndicesAttr(VtValue(pi));
+				if (b.normals) {
+					nrm.resize(b.n);
+					for (size_t k = 0; k < b.n; ++k) {
+						nrm[k] = GfVec3f(b.normals[k * 3], b.normals[k * 3 + 1], b.normals[k * 3 + 2]);
+					}
+					bs.CreateNormalOffsetsAttr(VtValue(nrm));
+				}
+				bn[s] = TfToken(id);
+				targets.push_back(bs.GetPath());
+			}
+			bapi.CreateBlendShapesAttr(VtValue(bn));
+			bapi.CreateBlendShapeTargetsRel().SetTargets(targets);
+			if (clip) {
+				const std::string apath = root_path + (skinned ? "/Skeleton/Motion" : "/Motion");
+				UsdSkelAnimation anim = UsdSkelAnimation::Define(stage, SdfPath(apath));
+				anim.CreateJointsAttr(VtValue(VtTokenArray()));
+				anim.CreateBlendShapesAttr(VtValue(bn));
+				anim.GetPrim().SetCustomDataByKey(TfToken("original_names"), VtValue(originals));
+				UsdAttribute wa = anim.CreateBlendShapeWeightsAttr();
+				const size_t K = shapes.size();
+				for (size_t f = 0; f < clip->frames; ++f) {
+					VtFloatArray w(clip->weights + f * K, clip->weights + (f + 1) * K);
+					if (!wa.Set(w, UsdTimeCode(double(f)))) {
+						return "ERR: blend weights failed at frame " + std::to_string(f) + ": " + first_error(mark);
+					}
+				}
+				UsdSkelBindingAPI holder = skinned ? UsdSkelBindingAPI::Apply(stage->GetPrimAtPath(SdfPath(root_path + "/Skeleton"))) : bapi;
+				holder.CreateAnimationSourceRel().SetTargets({ anim.GetPath() });
+			}
 		}
 		std::string text;
 		if (!stage->GetRootLayer()->ExportToString(&text)) {

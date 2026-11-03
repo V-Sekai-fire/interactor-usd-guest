@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -432,12 +433,87 @@ static Variant usd_write_curves(PackedArray<float> points, PackedArray<int32_t> 
 // line per joint (parent -1 for a root, parents before children), empty for no skin. floats: points (3 np),
 // uvs (nuv), rests (J x 24: parent-local rest 12 then world bind 12) and skin weights (np x element_size),
 // back to back. ints: face corner counts (nf), corners (ni) and skin indices, back to back.
+// Blend shapes (optional, after those blocks): nshapes=K; per shape i shape<i>=<name> (any text, even empty or a
+// repeat: the writer makes working names, see usdg::BlendShapeIn), shape<i>_n=<listed points> and
+// shape<i>_normals=0|1; per shape i with in-betweens shape<i>_ibs=M and, for j < M, shape<i>_ib<j>=<name> and
+// shape<i>_ib<j>_normals=0|1; clip_frames=F and clip_fps=<timeCodesPerSecond>. floats then also hold, per shape
+// in order: n x 3 offsets, n x 3 normal offsets when flagged, then per in-between: its weight (1 float, in
+// (0, 1)), n x 3 offsets, n x 3 normal offsets when flagged; last F x K clip weights (row per frame, shape
+// order, targets only). ints hold, per shape, its n strictly increasing point indices (an in-between uses its
+// target's). Keys of the form shape<digits>... listed above are never customLayerData.
+struct ShapeHdr {
+	struct Ib {
+		std::string name;
+		bool normals = false, has_name = false;
+	};
+	std::string name;
+	size_t n = 0, nib = 0;
+	bool normals = false, has_name = false, has_n = false;
+	std::map<size_t, Ib> ib;
+};
+
+// Reads "shape<i>", "shape<i>_n", "shape<i>_normals", "shape<i>_ibs", "shape<i>_ib<j>" and "shape<i>_ib<j>_normals";
+// kind 0 name, 1 n, 2 normals, 3 ibs, 4 ib name, 5 ib normals.
+static bool shape_key(const std::string &k, size_t &idx, size_t &jdx, int &kind) {
+	if (k.compare(0, 5, "shape") != 0) {
+		return false;
+	}
+	size_t e = 5;
+	while (e < k.size() && k[e] >= '0' && k[e] <= '9') {
+		++e;
+	}
+	if (e == 5 || e - 5 > 6) {
+		return false;
+	}
+	idx = (size_t)std::atoll(k.c_str() + 5);
+	const std::string suffix = k.substr(e);
+	if (suffix.empty()) {
+		kind = 0;
+		return true;
+	}
+	if (suffix == "_n") {
+		kind = 1;
+		return true;
+	}
+	if (suffix == "_normals") {
+		kind = 2;
+		return true;
+	}
+	if (suffix == "_ibs") {
+		kind = 3;
+		return true;
+	}
+	if (suffix.compare(0, 3, "_ib") != 0) {
+		return false;
+	}
+	size_t d = 3;
+	while (d < suffix.size() && suffix[d] >= '0' && suffix[d] <= '9') {
+		++d;
+	}
+	if (d == 3 || d - 3 > 6) {
+		return false;
+	}
+	jdx = (size_t)std::atoll(suffix.c_str() + 3);
+	const std::string tail = suffix.substr(d);
+	if (tail.empty()) {
+		kind = 4;
+		return true;
+	}
+	if (tail == "_normals") {
+		kind = 5;
+		return true;
+	}
+	return false;
+}
+
 static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> ints, String header, String joints) {
 	return guarded("usd_write_mesh", [&] {
 		const std::vector<float> f = floats.fetch();
 		const std::vector<int32_t> n = ints.fetch();
 		std::string name;
-		size_t np = 0, nuv = 0, nrest = 0, nf = 0, ni = 0;
+		size_t np = 0, nuv = 0, nrest = 0, nf = 0, ni = 0, nshapes = 0, clip_frames = 0;
+		double clip_fps = 0.0;
+		std::map<size_t, ShapeHdr> sh;
 		std::vector<std::pair<std::string, std::string>> m;
 		for (const std::string &ln : lines_of(header.utf8())) {
 			if (name.empty()) {
@@ -450,6 +526,8 @@ static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> in
 			}
 			const std::string k = ln.substr(0, eq);
 			const size_t v = (size_t)std::atoll(ln.c_str() + eq + 1);
+			size_t si = 0, sj = 0;
+			int kind = 0;
 			if (k == "np") {
 				np = v;
 			} else if (k == "nuv") {
@@ -460,15 +538,119 @@ static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> in
 				nf = v;
 			} else if (k == "ni") {
 				ni = v;
+			} else if (k == "nshapes") {
+				nshapes = v;
+			} else if (k == "clip_frames") {
+				clip_frames = v;
+			} else if (k == "clip_fps") {
+				clip_fps = std::atof(ln.c_str() + eq + 1);
+			} else if (shape_key(k, si, sj, kind)) {
+				ShapeHdr &h = sh[si];
+				if (kind == 0) {
+					h.name = ln.substr(eq + 1);
+					h.has_name = true;
+				} else if (kind == 1) {
+					h.n = v;
+					h.has_n = true;
+				} else if (kind == 2) {
+					h.normals = v != 0;
+				} else if (kind == 3) {
+					h.nib = v;
+				} else if (kind == 4) {
+					h.ib[sj].name = ln.substr(eq + 1);
+					h.ib[sj].has_name = true;
+				} else {
+					h.ib[sj].normals = v != 0;
+				}
 			} else {
 				m.emplace_back(k, ln.substr(eq + 1));
 			}
 		}
-		if (f.size() < np * 3 + nuv + nrest || n.size() < nf + ni) {
+		// The blend-shape blocks sit after the skin blocks; their sizes come from the header.
+		if (nshapes > 100000) {
+			return fail("usd_write_mesh: nshapes=" + std::to_string(nshapes) + " is not plausible");
+		}
+		if (nshapes == 0 && (!sh.empty() || clip_frames != 0)) {
+			return fail("usd_write_mesh: shape or clip keys without nshapes");
+		}
+		size_t shape_floats = 0, shape_ints = 0;
+		for (size_t i = 0; i < nshapes; ++i) {
+			const auto it = sh.find(i);
+			if (it == sh.end() || !it->second.has_name || !it->second.has_n) {
+				return fail("usd_write_mesh: shape" + std::to_string(i) + " needs shape" + std::to_string(i) + " and shape" +
+						std::to_string(i) + "_n");
+			}
+			const ShapeHdr &h = it->second;
+			if (h.n > n.size() || h.n > f.size()) {
+				return fail("usd_write_mesh: shape" + std::to_string(i) + "_n is longer than the arrays");
+			}
+			if (h.nib > 10000 || (!h.ib.empty() && h.ib.rbegin()->first >= h.nib)) {
+				return fail("usd_write_mesh: shape" + std::to_string(i) + "_ibs=" + std::to_string(h.nib) + " does not match its shape" +
+						std::to_string(i) + "_ib<j> keys");
+			}
+			shape_floats += h.n * 3 * (h.normals ? 2 : 1);
+			shape_ints += h.n;
+			for (size_t j = 0; j < h.nib; ++j) {
+				const auto jt = h.ib.find(j);
+				if (jt == h.ib.end() || !jt->second.has_name) {
+					return fail("usd_write_mesh: shape" + std::to_string(i) + "_ib" + std::to_string(j) + " is missing");
+				}
+				shape_floats += 1 + h.n * 3 * (jt->second.normals ? 2 : 1);
+			}
+		}
+		if (!sh.empty() && sh.rbegin()->first >= nshapes) {
+			return fail("usd_write_mesh: shape" + std::to_string(sh.rbegin()->first) + " is past nshapes=" + std::to_string(nshapes));
+		}
+		if (nshapes > 0 && clip_frames > 0) {
+			if (clip_frames > f.size() / nshapes) {
+				return fail("usd_write_mesh: clip_frames x nshapes is longer than the float array");
+			}
+			shape_floats += clip_frames * nshapes;
+		}
+		if (f.size() < np * 3 + nuv + nrest + shape_floats || n.size() < nf + ni + shape_ints) {
 			return fail("usd_write_mesh: the arrays are shorter than the header sizes");
 		}
-		const size_t nw = f.size() - np * 3 - nuv - nrest, nsi = n.size() - nf - ni;
+		const size_t nw = f.size() - np * 3 - nuv - nrest - shape_floats, nsi = n.size() - nf - ni - shape_ints;
 		const float *pts = f.data(), *uv = pts + np * 3, *rests = uv + nuv, *w = rests + nrest;
+		std::vector<usdg::BlendShapeIn> shapes;
+		usdg::BlendClipIn clip;
+		{
+			const float *sf = w + nw;
+			const int32_t *sidx = n.data() + nf + ni + nsi;
+			for (size_t i = 0; i < nshapes; ++i) {
+				const ShapeHdr &h = sh[i];
+				usdg::BlendShapeIn b;
+				b.name = h.name;
+				b.n = h.n;
+				b.indices = sidx;
+				b.offsets = sf;
+				sidx += h.n;
+				sf += h.n * 3;
+				if (h.normals) {
+					b.normals = sf;
+					sf += h.n * 3;
+				}
+				for (size_t j = 0; j < h.nib; ++j) {
+					const ShapeHdr::Ib &hi = h.ib.at(j);
+					usdg::InbetweenIn ib;
+					ib.name = hi.name;
+					ib.weight = *sf++;
+					ib.offsets = sf;
+					sf += h.n * 3;
+					if (hi.normals) {
+						ib.normals = sf;
+						sf += h.n * 3;
+					}
+					b.inbetweens.push_back(ib);
+				}
+				shapes.push_back(b);
+			}
+			if (nshapes > 0 && clip_frames > 0) {
+				clip.frames = clip_frames;
+				clip.fps = clip_fps;
+				clip.weights = sf;
+			}
+		}
 		std::vector<std::string> j;
 		std::vector<int32_t> pa;
 		for (const std::string &ln : lines_of(joints.utf8())) {
@@ -499,7 +681,7 @@ static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> in
 		}
 		const std::vector<int32_t> c(n.begin(), n.begin() + nf), ix(n.begin() + nf, n.begin() + nf + ni);
 		const std::string z = usdg::write_mesh(name, pts, np, c, ix, nuv ? uv : nullptr, j, pa, rest.data(), bind.data(),
-				n.data() + nf + ni, w, element_size, m);
+				n.data() + nf + ni, w, element_size, m, shapes, clip.frames ? &clip : nullptr);
 		if (z.compare(0, 5, "ERR: ") == 0) {
 			return text(z);
 		}
@@ -513,6 +695,13 @@ static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> in
 // RFD66606-2277 A2: one motion clip as a UsdSkel .usda (usdg::write_skel_clip).
 // rests: J x 24 floats, each joint's parent-local rest (12) then its world
 // bind (12); anim_local: frames x anim_joints x 12. Names and meta one per line.
+// Blend-shape weights in the same SkelAnimation (the call already uses the host's seven arguments, so the
+// new data rides in the existing ones): meta keys nshapes=K and shape<i>=<name> for i < K (any text; the
+// writer makes working names and keeps the originals, see usdg::BlendShapeIn; they are never
+// customLayerData), and anim_local then holds, after the frames x anim_joints x 12 transform floats,
+// frames x K weights (row per frame, shape order). frames = len / (anim_joints x 12 + K). With no animated
+// joints the clip is weights only and meta clip_frames=F gives the frame count. Without nshapes the call
+// is as it was.
 static Variant usd_write_skel_clip(String names, PackedArray<int32_t> parents, PackedArray<float> rests,
 		PackedArray<int32_t> anim_joints, PackedArray<float> anim_local, double fps, String meta) {
 	return guarded("usd_write_skel_clip", [&] {
@@ -524,24 +713,74 @@ static Variant usd_write_skel_clip(String names, PackedArray<int32_t> parents, P
 		if (r.size() != n.size() * 24) {
 			return fail("usd_write_skel_clip: " + std::to_string(r.size()) + " rest floats for " + std::to_string(n.size()) + " joints");
 		}
-		if (aj.empty() || al.size() % (aj.size() * 12) != 0) {
-			return fail("usd_write_skel_clip: animation floats are not frames x joints x 12");
-		}
 		std::vector<float> rest_local(n.size() * 12), bind_world(n.size() * 12);
 		for (size_t j = 0; j < n.size(); ++j) {
 			std::copy(&r[j * 24], &r[j * 24 + 12], &rest_local[j * 12]);
 			std::copy(&r[j * 24 + 12], &r[j * 24 + 24], &bind_world[j * 12]);
 		}
 		std::vector<std::pair<std::string, std::string>> m;
+		size_t nshapes = 0, clip_frames = 0;
+		std::map<size_t, std::string> shape_names;
 		for (const std::string &kv : lines_of(meta.utf8())) {
 			const size_t eq = kv.find('=');
 			if (eq == std::string::npos) {
 				return fail("usd_write_skel_clip: meta line '" + kv + "' has no '='");
 			}
-			m.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+			const std::string k = kv.substr(0, eq);
+			size_t si = 0, sj = 0;
+			int kind = 0;
+			if (k == "nshapes") {
+				nshapes = (size_t)std::atoll(kv.c_str() + eq + 1);
+			} else if (k == "clip_frames") {
+				clip_frames = (size_t)std::atoll(kv.c_str() + eq + 1);
+			} else if (shape_key(k, si, sj, kind) && kind == 0) {
+				shape_names[si] = kv.substr(eq + 1);
+			} else {
+				m.emplace_back(k, kv.substr(eq + 1));
+			}
 		}
-		return text(usdg::write_skel_clip(n, p, rest_local.data(), bind_world.data(), aj, al.data(),
-				al.size() / (aj.size() * 12), fps, m));
+		if (nshapes > 100000) {
+			return fail("usd_write_skel_clip: nshapes=" + std::to_string(nshapes) + " is not plausible");
+		}
+		if (nshapes == 0 && (!shape_names.empty() || clip_frames != 0)) {
+			return fail("usd_write_skel_clip: shape or clip_frames keys without nshapes");
+		}
+		if (nshapes == 0) {
+			if (aj.empty() || al.size() % (aj.size() * 12) != 0) {
+				return fail("usd_write_skel_clip: animation floats are not frames x joints x 12");
+			}
+			return text(usdg::write_skel_clip(n, p, rest_local.data(), bind_world.data(), aj, al.data(),
+					al.size() / (aj.size() * 12), fps, m));
+		}
+		std::vector<std::string> shapes;
+		for (size_t i = 0; i < nshapes; ++i) {
+			const auto it = shape_names.find(i);
+			if (it == shape_names.end()) {
+				return fail("usd_write_skel_clip: shape" + std::to_string(i) + " is missing");
+			}
+			shapes.push_back(it->second);
+		}
+		if (!shape_names.empty() && shape_names.rbegin()->first >= nshapes) {
+			return fail("usd_write_skel_clip: shape" + std::to_string(shape_names.rbegin()->first) + " is past nshapes=" + std::to_string(nshapes));
+		}
+		const size_t row = aj.size() * 12 + nshapes;
+		size_t frames = 0;
+		if (aj.empty()) {
+			frames = clip_frames;
+			if (frames == 0 || al.size() != frames * nshapes) {
+				return fail("usd_write_skel_clip: a weights-only clip needs clip_frames and frames x shapes floats");
+			}
+		} else {
+			if (al.size() == 0 || al.size() % row != 0) {
+				return fail("usd_write_skel_clip: animation floats are not frames x (joints x 12 + shapes)");
+			}
+			frames = al.size() / row;
+			if (clip_frames != 0 && clip_frames != frames) {
+				return fail("usd_write_skel_clip: clip_frames=" + std::to_string(clip_frames) + " but the floats hold " + std::to_string(frames));
+			}
+		}
+		return text(usdg::write_skel_clip(n, p, rest_local.data(), bind_world.data(), aj, al.data(), frames, fps, m, shapes,
+				al.data() + frames * aj.size() * 12));
 	});
 }
 
@@ -562,6 +801,7 @@ static Variant usd_skel_anim_info(int i) {
 		d["njoints"] = Variant((int64_t)a.njoints);
 		d["fps"] = Variant(a.fps);
 		d["blend_shapes"] = text(a.shapes);
+		d["blend_shape_tokens"] = text(a.tokens);
 		d["nshapes"] = Variant((int64_t)a.nshapes);
 		d["times"] = text(a.times);
 		return Variant(d);
@@ -603,6 +843,7 @@ static Variant usd_blend_shape_info(int k) {
 		}
 		Dictionary d = Dictionary::Create();
 		d["name"] = text(b.name);
+		d["token"] = text(b.token);
 		d["mesh"] = Variant(b.mesh);
 		d["primary"] = Variant(b.primary);
 		d["position"] = Variant((double)b.position);
@@ -840,16 +1081,16 @@ int main() {
 			"A .usda of linear BasisCurves under /Creation (names and k=v meta one per line), or ERR:");
 	ADD_API_FUNCTION(usd_write_mesh, "PackedByteArray",
 			"PackedFloat32Array floats, PackedInt32Array ints, String header, String joints",
-			"A .usdz package of one mesh with its uvs and skin (four packed arguments: the host has seven registers), or an ERR: String");
+			"A .usdz package of one mesh with its uvs, skin, optional sparse blend shapes and weight clip (header keys nshapes, shape<i>, shape<i>_n, shape<i>_normals, clip_frames, clip_fps; four packed arguments: the host has seven registers), or an ERR: String");
 	ADD_API_FUNCTION(usd_write_skel_clip, "String",
 			"String names, PackedInt32Array parents, PackedFloat32Array rests, PackedInt32Array anim_joints, PackedFloat32Array anim_local, float fps, String meta",
-			"A .usda of one UsdSkel motion clip (RFD 2277 A2), or ERR:");
+			"A .usda of one UsdSkel motion clip (RFD 2277 A2), optionally with blend-shape weights in the same SkelAnimation (meta nshapes, shape<i>, clip_frames; weights after the transform floats), or ERR:");
 	ADD_API_FUNCTION(usd_skel_anim_count, "int", "", "UsdSkelAnimation prims in the document");
-	ADD_API_FUNCTION(usd_skel_anim_info, "Dictionary", "int i", "path, joints, frames, njoints, fps, blend_shapes, nshapes, times");
+	ADD_API_FUNCTION(usd_skel_anim_info, "Dictionary", "int i", "path, joints, frames, njoints, fps, blend_shapes (original names when kept, one per line), blend_shape_tokens (as authored), nshapes, times");
 	ADD_API_FUNCTION(usd_skel_anim_transforms, "PackedFloat32Array", "int i", "frames x joints x 12: parent-local 3x3 (row-major) then translation");
 	ADD_API_FUNCTION(usd_skel_anim_blend_weights, "PackedFloat32Array", "int i", "frames x nshapes blend-shape weights, in the clip's blend_shapes order");
 	ADD_API_FUNCTION(usd_blend_shape_count, "int", "", "blend-shape records (targets and in-betweens) of all meshes");
-	ADD_API_FUNCTION(usd_blend_shape_info, "Dictionary", "int k", "name, mesh, primary, position, has_normals, points, blake3_offsets");
+	ADD_API_FUNCTION(usd_blend_shape_info, "Dictionary", "int k", "name (original when kept), token (as authored), mesh, primary, position, has_normals, points, blake3_offsets");
 	ADD_API_FUNCTION(usd_blend_shape_offsets_slice, "PackedFloat32Array", "int k, int from, int count", "offsets of vertices [from, from+count), 3 floats a vertex");
 	ADD_API_FUNCTION(usd_blend_shape_normals_slice, "PackedFloat32Array", "int k, int from, int count", "normal offsets of vertices [from, from+count)");
 	ADD_API_FUNCTION(usd_skeleton_count, "int", "", "UsdSkelSkeleton prims in the document");
