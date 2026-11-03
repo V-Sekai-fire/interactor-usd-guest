@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -187,11 +188,27 @@ struct BlendClipIn {
 	double fps = 0.0;
 	const float *weights = nullptr; // frames x shapes
 };
+// A MaterialIn adds one UsdPreviewSurface material, /<name>/Looks/<material name>, bound to the mesh
+// (UsdShade material binding). Each *_tex names a member of the package ("textures/Blue_A.png"): its bytes come
+// in `textures` (member name -> file bytes) and are stored in the .usdz beside the layer, so the authored asset
+// paths resolve inside the package and the package is one file. An empty *_tex uses the constant instead.
+// diffuse_tex is read as sRGB; normal_tex raw, as a tangent-space map (scale 2, bias -1); metallic_tex,
+// roughness_tex and opacity_tex raw, their red channel. A texture needs the mesh's "st" uvs (uvs not null).
+struct MaterialIn {
+	std::string name = "Material"; // a valid prim name
+	float diffuse[3] = { 1.0f, 1.0f, 1.0f };
+	float metallic = 0.0f;
+	float roughness = 0.5f;
+	float opacity = 1.0f;
+	std::string diffuse_tex, normal_tex, metallic_tex, roughness_tex, opacity_tex;
+	bool double_sided = false;
+};
 std::string write_mesh(const std::string &name, const float *points, size_t n_points, const std::vector<int32_t> &counts,
 		const std::vector<int32_t> &indices, const float *uvs, const std::vector<std::string> &joints,
 		const std::vector<int32_t> &parents, const float *rest_local, const float *bind_world, const int32_t *skin_indices,
 		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta,
-		const std::vector<BlendShapeIn> &shapes = {}, const BlendClipIn *clip = nullptr);
+		const std::vector<BlendShapeIn> &shapes = {}, const BlendClipIn *clip = nullptr, const MaterialIn *material = nullptr,
+		const std::map<std::string, std::string> *textures = nullptr);
 
 // UsdSkelSkeleton prims, in Traverse() order. Joint transforms are 12 floats
 // as the animation table's: bind is each joint's bindTransforms entry, rest its
