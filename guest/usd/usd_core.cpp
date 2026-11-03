@@ -18,13 +18,12 @@
 
 #include "usd_core.h"
 
-#include "mem_resolver.h"
 #include "common/blake3.h"
+#include "mem_resolver.h"
 
 #include <algorithm>
 #include <map>
 
-#include "pxr/pxr.h"
 #include "pxr/base/gf/matrix4d.h"
 #include "pxr/base/gf/vec2f.h"
 #include "pxr/base/gf/vec3f.h"
@@ -34,6 +33,7 @@
 #include "pxr/base/tf/token.h"
 #include "pxr/base/vt/array.h"
 #include "pxr/base/vt/dictionary.h"
+#include "pxr/pxr.h"
 #include "pxr/usd/ar/asset.h"
 #include "pxr/usd/ar/packageUtils.h"
 #include "pxr/usd/ar/resolvedPath.h"
@@ -61,10 +61,10 @@
 #include "pxr/usd/usdSkel/animQuery.h"
 #include "pxr/usd/usdSkel/animation.h"
 #include "pxr/usd/usdSkel/binding.h"
-#include "pxr/usd/usdSkel/blendShape.h"
-#include "pxr/usd/usdSkel/inbetweenShape.h"
 #include "pxr/usd/usdSkel/bindingAPI.h"
+#include "pxr/usd/usdSkel/blendShape.h"
 #include "pxr/usd/usdSkel/cache.h"
+#include "pxr/usd/usdSkel/inbetweenShape.h"
 #include "pxr/usd/usdSkel/root.h"
 #include "pxr/usd/usdSkel/skeleton.h"
 #include "pxr/usd/usdSkel/skeletonQuery.h"
@@ -209,8 +209,9 @@ std::string str(const Span &s) {
 }
 
 std::string first_error(const TfErrorMark &m) {
-	for (auto it = m.GetBegin(); it != m.GetEnd(); ++it)
+	for (auto it = m.GetBegin(); it != m.GetEnd(); ++it) {
 		return it->GetCommentary();
+	}
 	return "unknown";
 }
 
@@ -226,27 +227,33 @@ int add_texture(const SdfAssetPath &ap, const std::string &layer_path, std::stri
 	if (resolved.empty() && !authored.empty()) {
 		ArResolver &r = ArGetResolver();
 		resolved = r.Resolve(authored).GetPathString();
-		if (resolved.empty() && TfStringEndsWith(layer_path, ".usdz") && authored[0] != '/')
+		if (resolved.empty() && TfStringEndsWith(layer_path, ".usdz") && authored[0] != '/') {
 			resolved = ArJoinPackageRelativePath(layer_path, TfNormPath(authored));
+		}
 	}
 	auto missing = [&](const std::string &w) {
 		why = w;
-		if (std::find(g_tex_missing.begin(), g_tex_missing.end(), authored) == g_tex_missing.end())
+		if (std::find(g_tex_missing.begin(), g_tex_missing.end(), authored) == g_tex_missing.end()) {
 			g_tex_missing.push_back(authored);
+		}
 		return -1;
 	};
-	if (resolved.empty())
+	if (resolved.empty()) {
 		return missing("texture '" + authored + "' does not resolve");
+	}
 	auto it = g_tex_by_path.find(resolved);
-	if (it != g_tex_by_path.end())
+	if (it != g_tex_by_path.end()) {
 		return it->second;
+	}
 	std::shared_ptr<ArAsset> asset = ArGetResolver().OpenAsset(ArResolvedPath(resolved));
-	if (!asset)
+	if (!asset) {
 		return missing("texture '" + resolved + "' cannot be opened");
+	}
 	const size_t n = asset->GetSize();
 	std::shared_ptr<const char> buf = asset->GetBuffer();
-	if (!buf || n == 0)
+	if (!buf || n == 0) {
 		return missing("texture '" + resolved + "' is empty");
+	}
 	TexRec t;
 	t.path = intern(resolved);
 	t.file = intern(authored);
@@ -268,15 +275,17 @@ template <typename T>
 void read_input(const UsdShadeShader &surface, const char *name, const std::string &layer_path, T *value,
 		int &tex, Span &channel, Span &file_span, std::string &warn) {
 	UsdShadeInput in = surface.GetInput(TfToken(name));
-	if (!in)
+	if (!in) {
 		return;
+	}
 	UsdShadeConnectableAPI src;
 	TfToken src_name;
 	UsdShadeAttributeType src_type;
 	if (in.GetConnectedSource(&src, &src_name, &src_type)) {
 		UsdShadeShader texsh(src.GetPrim());
-		if (!texsh)
+		if (!texsh) {
 			return;
+		}
 		UsdShadeInput file = texsh.GetInput(TfToken("file"));
 		SdfAssetPath ap;
 		if (!file || !file.Get(&ap)) {
@@ -286,31 +295,37 @@ void read_input(const UsdShadeShader &surface, const char *name, const std::stri
 		std::string why;
 		file_span = intern(ap.GetAssetPath());
 		tex = add_texture(ap, layer_path, why);
-		if (tex < 0)
+		if (tex < 0) {
 			warn = std::string(name) + ": " + why;
+		}
 		channel = intern(src_name.GetString());
 		// A UsdUVTexture's fallback stands in for a texture that did not resolve.
 		if (tex < 0 && value) {
 			UsdShadeInput fb = texsh.GetInput(TfToken("fallback"));
 			GfVec4f f;
 			if (fb && fb.Get(&f)) {
-				if constexpr (std::is_same<T, GfVec3f>::value)
+				if constexpr (std::is_same<T, GfVec3f>::value) {
 					*value = GfVec3f(f[0], f[1], f[2]);
-				else
-					*value = src_name == TfToken("r") ? f[0] : src_name == TfToken("g") ? f[1] : src_name == TfToken("b") ? f[2] : f[3];
+				} else {
+					*value = src_name == TfToken("r") ? f[0] : src_name == TfToken("g") ? f[1]
+							: src_name == TfToken("b")									? f[2]
+																						: f[3];
+				}
 			}
 		}
 		return;
 	}
-	if (value)
+	if (value) {
 		in.Get(value);
+	}
 }
 
 int add_material(const UsdShadeMaterial &mat, const std::string &layer_path, std::string &warn) {
 	const std::string path = mat.GetPath().GetString();
 	auto it = g_mat_by_path.find(path);
-	if (it != g_mat_by_path.end())
+	if (it != g_mat_by_path.end()) {
 		return it->second;
+	}
 	MatRec m;
 	m.path = intern(path);
 	m.name = intern(mat.GetPrim().GetName().GetString());
@@ -342,16 +357,19 @@ int add_material(const UsdShadeMaterial &mat, const std::string &layer_path, std
 // or the normals attribute, flattened; interp says which. Empty when absent.
 template <typename ArrayT>
 bool read_pv(const UsdGeomPrimvar &pv, ArrayT *out, TfToken *interp) {
-	if (!pv || !pv.HasValue())
+	if (!pv || !pv.HasValue()) {
 		return false;
+	}
 	*interp = pv.GetInterpolation();
 	return pv.ComputeFlattened(out, UsdTimeCode::Default()) && !out->empty();
 }
 
 void matrix_to16(const GfMatrix4d &m, float *o) {
-	for (int i = 0; i < 4; ++i)
-		for (int j = 0; j < 4; ++j)
+	for (int i = 0; i < 4; ++i) {
+		for (int j = 0; j < 4; ++j) {
 			o[i * 4 + j] = (float)m[i][j];
+		}
+	}
 }
 
 struct SkinSrc {
@@ -365,42 +383,50 @@ struct SkinSrc {
 // skeleton does not have, is refused.
 std::string add_skin(const SkinSrc &src, size_t usd_points, const VtIntArray &fvi, MeshRec &r) {
 	const UsdSkelSkinningQuery &q = src.query;
-	if (!q.HasJointInfluences())
+	if (!q.HasJointInfluences()) {
 		return "";
+	}
 	VtIntArray ji;
 	VtFloatArray jw;
-	if (!q.ComputeJointInfluences(&ji, &jw))
+	if (!q.ComputeJointInfluences(&ji, &jw)) {
 		return "joint influences do not compute";
+	}
 	const int e = q.GetNumInfluencesPerComponent();
 	const bool constant = q.GetInterpolation() == UsdGeomTokens->constant;
 	const size_t want = (constant ? 1 : usd_points) * (size_t)(e > 0 ? e : 0);
-	if (e <= 0 || ji.size() != want || jw.size() != want)
+	if (e <= 0 || ji.size() != want || jw.size() != want) {
 		return "skin: " + std::to_string(ji.size()) + " indices and " + std::to_string(jw.size()) + " weights, elementSize " +
 				std::to_string(e) + " over " + std::to_string(usd_points) + " points (" + q.GetInterpolation().GetString() + ")";
+	}
 	const SkelRec &s = g_skels[(size_t)src.skel];
 	VtIntArray skel_order(s.njoints), to_skel;
-	for (size_t j = 0; j < s.njoints; ++j)
+	for (size_t j = 0; j < s.njoints; ++j) {
 		skel_order[j] = (int)j;
+	}
 	const UsdSkelAnimMapperRefPtr &mapper = q.GetJointMapper();
 	const int unmapped = -1;
-	if (mapper && !mapper->IsIdentity())
+	if (mapper && !mapper->IsIdentity()) {
 		mapper->Remap(skel_order, &to_skel, 1, &unmapped);
-	else
+	} else {
 		to_skel = skel_order;
+	}
 	VtTokenArray order;
 	std::string jl;
 	if (q.GetJointOrder(&order)) {
-		for (const TfToken &t : order)
+		for (const TfToken &t : order) {
 			jl += t.GetString() + "\n";
+		}
 	} else {
 		jl = str(s.joints);
 	}
 	for (size_t k = 0; k < ji.size(); ++k) {
 		const int j = ji[k];
-		if (j < 0 || (size_t)j >= to_skel.size())
+		if (j < 0 || (size_t)j >= to_skel.size()) {
 			return "skin: joint index " + std::to_string(j) + " out of range (" + std::to_string(to_skel.size()) + " joints)";
-		if (to_skel[(size_t)j] < 0 && jw[k] != 0.0f)
+		}
+		if (to_skel[(size_t)j] < 0 && jw[k] != 0.0f) {
 			return "skin: weight on joint " + std::to_string(j) + ", which the skeleton does not have";
+		}
 	}
 	SkinRec k;
 	k.skel = src.skel;
@@ -408,13 +434,15 @@ std::string add_skin(const SkinSrc &src, size_t usd_points, const VtIntArray &fv
 	k.interp = intern(q.GetInterpolation().GetString());
 	k.joints = intern(jl);
 	TfToken method = UsdSkelTokens->classicLinear;
-	if (q.GetSkinningMethodAttr())
+	if (q.GetSkinningMethodAttr()) {
 		q.GetSkinningMethodAttr().Get(&method);
+	}
 	k.method = intern(method.GetString());
 	matrix_to16(q.GetGeomBindTransform(), k.geom);
 	k.off = g_skin_idx.size();
 	for (size_t v = 0; v < r.npts; ++v) {
-		const size_t p = constant ? 0 : r.indexed ? v : (size_t)fvi[v];
+		const size_t p = constant ? 0 : r.indexed ? v
+												  : (size_t)fvi[v];
 		int nonzero = 0;
 		for (int c = 0; c < e; ++c) {
 			const int mapped = to_skel[(size_t)ji[p * e + c]];
@@ -442,65 +470,77 @@ std::string add_blend_shapes(const UsdPrim &prim, size_t usd_points, const VtInt
 	UsdSkelBindingAPI binding(prim);
 	VtTokenArray names;
 	SdfPathVector targets;
-	if (!binding.GetBlendShapesAttr().Get(&names) || names.empty())
+	if (!binding.GetBlendShapesAttr().Get(&names) || names.empty()) {
 		return "";
+	}
 	binding.GetBlendShapeTargetsRel().GetTargets(&targets);
-	if (targets.size() != names.size())
+	if (targets.size() != names.size()) {
 		return "skel:blendShapes has " + std::to_string(names.size()) + " names and skel:blendShapeTargets " +
 				std::to_string(targets.size()) + " targets";
+	}
 	const UsdStageWeakPtr stage = prim.GetStage();
 	auto densify = [&](const VtVec3fArray &vals, const VtIntArray &pi, std::vector<float> &dst, size_t &off,
 						   const std::string &what) -> std::string {
 		std::vector<float> per_point(usd_points * 3, 0.0f);
 		if (pi.empty()) {
-			if (vals.size() != usd_points)
+			if (vals.size() != usd_points) {
 				return what + ": " + std::to_string(vals.size()) + " values for " + std::to_string(usd_points) + " points";
-			for (size_t p = 0; p < usd_points; ++p)
-				for (int c = 0; c < 3; ++c)
+			}
+			for (size_t p = 0; p < usd_points; ++p) {
+				for (int c = 0; c < 3; ++c) {
 					per_point[p * 3 + c] = vals[p][c];
+				}
+			}
 		} else {
-			if (vals.size() != pi.size())
+			if (vals.size() != pi.size()) {
 				return what + ": " + std::to_string(vals.size()) + " values for " + std::to_string(pi.size()) + " pointIndices";
+			}
 			for (size_t k = 0; k < pi.size(); ++k) {
-				if (pi[k] < 0 || (size_t)pi[k] >= usd_points)
+				if (pi[k] < 0 || (size_t)pi[k] >= usd_points) {
 					return what + ": pointIndices entry " + std::to_string(pi[k]) + " out of range";
-				for (int c = 0; c < 3; ++c)
+				}
+				for (int c = 0; c < 3; ++c) {
 					per_point[(size_t)pi[k] * 3 + c] = vals[k][c];
+				}
 			}
 		}
 		off = dst.size();
 		dst.resize(off + r.npts * 3);
 		for (size_t v = 0; v < r.npts; ++v) {
 			const size_t p = r.indexed ? v : (size_t)fvi[v];
-			for (int c = 0; c < 3; ++c)
+			for (int c = 0; c < 3; ++c) {
 				dst[off + v * 3 + c] = per_point[p * 3 + c];
+			}
 		}
 		return "";
 	};
 	for (size_t b = 0; b < names.size(); ++b) {
 		UsdSkelBlendShape bs(stage->GetPrimAtPath(targets[b]));
-		if (!bs)
+		if (!bs) {
 			return "blend shape target " + targets[b].GetString() + " is not a BlendShape";
+		}
 		VtVec3fArray offsets, normals;
 		VtIntArray pi;
 		bs.GetOffsetsAttr().Get(&offsets);
 		bs.GetNormalOffsetsAttr().Get(&normals);
 		bs.GetPointIndicesAttr().Get(&pi);
 		auto add = [&](const std::string &name, int primary, float position, const VtVec3fArray &o,
-					   const VtVec3fArray &n) -> std::string {
+						   const VtVec3fArray &n) -> std::string {
 			ShapeRec k;
 			k.name = intern(name);
 			k.mesh = (int)g_meshes.size();
 			k.primary = primary;
 			k.position = position;
 			std::string e = densify(o, pi, g_shape_off, k.off, name + " offsets");
-			if (!e.empty())
+			if (!e.empty()) {
 				return e;
+			}
 			k.has_normals = !n.empty();
 			if (k.has_normals) {
 				e = densify(n, pi, g_shape_nrm, k.nrm_off, name + " normalOffsets");
-				if (!e.empty())
+				if (!e.empty()) {
 					return e;
+				}
 			}
 			k.b3 = intern(blake3::hex(g_shape_off.data() + k.off, r.npts * 3 * sizeof(float)));
 			g_shapes.push_back(k);
@@ -508,18 +548,21 @@ std::string add_blend_shapes(const UsdPrim &prim, size_t usd_points, const VtInt
 		};
 		const int primary = (int)g_shapes.size();
 		std::string e = add(names[b].GetString(), -1, 1.0f, offsets, normals);
-		if (!e.empty())
+		if (!e.empty()) {
 			return e;
+		}
 		for (const UsdSkelInbetweenShape &ib : bs.GetAuthoredInbetweens()) {
 			float position = 0.0f;
-			if (!ib.GetWeight(&position) || !(position > 0.0f) || !(position < 1.0f))
+			if (!ib.GetWeight(&position) || !(position > 0.0f) || !(position < 1.0f)) {
 				continue; // the schema allows other weights; Godot's in-between bake needs (0, 1)
+			}
 			VtVec3fArray io, in;
 			ib.GetOffsets(&io);
 			ib.GetNormalOffsets(&in);
 			e = add(names[b].GetString() + ":" + ib.GetAttr().GetBaseName().GetString(), primary, position, io, in);
-			if (!e.empty())
+			if (!e.empty()) {
 				return e;
+			}
 		}
 	}
 	r.nshapes = g_shapes.size() - r.shape_first;
@@ -540,15 +583,19 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 	mesh.GetHoleIndicesAttr().Get(&holes, UsdTimeCode::Default());
 	size_t corners = 0;
 	for (int c : fvc) {
-		if (c < 0)
+		if (c < 0) {
 			return "faceVertexCounts has a negative count";
+		}
 		corners += (size_t)c;
 	}
-	if (corners != fvi.size())
+	if (corners != fvi.size()) {
 		return "faceVertexCounts sum " + std::to_string(corners) + " != faceVertexIndices " + std::to_string(fvi.size());
-	for (int i : fvi)
-		if (i < 0 || (size_t)i >= pts.size())
+	}
+	for (int i : fvi) {
+		if (i < 0 || (size_t)i >= pts.size()) {
 			return "faceVertexIndices out of range (" + std::to_string(i) + " of " + std::to_string(pts.size()) + " points)";
+		}
+	}
 
 	// normals: primvars:normals wins over the normals attribute (UsdGeom's rule)
 	UsdGeomPrimvarsAPI pvapi(prim);
@@ -556,8 +603,9 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 	TfToken nrm_interp;
 	if (!read_pv(pvapi.GetPrimvar(UsdGeomTokens->normals), &nrm, &nrm_interp)) {
 		nrm.clear();
-		if (mesh.GetNormalsAttr().Get(&nrm, UsdTimeCode::Default()) && !nrm.empty())
+		if (mesh.GetNormalsAttr().Get(&nrm, UsdTimeCode::Default()) && !nrm.empty()) {
 			nrm_interp = mesh.GetNormalsInterpolation();
+		}
 	}
 	// st: primvars:st, else the first texCoord2f / float2 primvar
 	VtVec2fArray st;
@@ -567,8 +615,9 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 		for (const UsdGeomPrimvar &pv : pvapi.GetPrimvarsWithValues()) {
 			const SdfValueTypeName t = pv.GetTypeName();
 			if (t == SdfValueTypeNames->TexCoord2fArray || t == SdfValueTypeNames->Float2Array) {
-				if (read_pv(pv, &st, &st_interp))
+				if (read_pv(pv, &st, &st_interp)) {
 					break;
+				}
 				st.clear();
 			}
 		}
@@ -604,35 +653,42 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 	mesh.GetOrientationAttr().Get(&orient);
 	const bool flip = orient == UsdGeomTokens->leftHanded;
 	std::vector<char> hole(fvc.size(), 0);
-	for (int h : holes)
-		if (h >= 0 && (size_t)h < hole.size())
+	for (int h : holes) {
+		if (h >= 0 && (size_t)h < hole.size()) {
 			hole[h] = 1;
+		}
+	}
 	mesh.GetDoubleSidedAttr().Get(&r.double_sided);
 
 	// Group 0 is the mesh's own binding; each materialBind GeomSubset is a group of its faces.
 	std::vector<int> group_mat(1, -1);
 	UsdShadeMaterial mat = UsdShadeMaterialBindingAPI(prim).ComputeBoundMaterial();
 	std::string mwarn;
-	if (mat)
+	if (mat) {
 		group_mat[0] = add_material(mat, layer_path, mwarn);
+	}
 	std::vector<int> face_group(fvc.size(), 0);
 	const std::vector<UsdGeomSubset> subsets = UsdShadeMaterialBindingAPI(prim).GetMaterialBindSubsets();
 	for (const UsdGeomSubset &s : subsets) {
 		TfToken et;
 		s.GetElementTypeAttr().Get(&et);
-		if (et != UsdGeomTokens->face)
+		if (et != UsdGeomTokens->face) {
 			continue;
+		}
 		VtIntArray faces;
 		s.GetIndicesAttr().Get(&faces, UsdTimeCode::Default());
 		UsdShadeMaterial sm = UsdShadeMaterialBindingAPI(s.GetPrim()).ComputeBoundMaterial();
 		const int g = (int)group_mat.size();
 		group_mat.push_back(sm ? add_material(sm, layer_path, mwarn) : -1);
-		for (int f : faces)
-			if (f >= 0 && (size_t)f < face_group.size())
+		for (int f : faces) {
+			if (f >= 0 && (size_t)f < face_group.size()) {
 				face_group[(size_t)f] = g;
+			}
+		}
 	}
-	if (!mwarn.empty() && warn.empty())
+	if (!mwarn.empty() && warn.empty()) {
 		warn = mwarn;
+	}
 
 	// vertices
 	r.pt_off = g_points.size();
@@ -656,33 +712,38 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 		}
 	};
 	if (r.indexed) {
-		for (size_t p = 0; p < pts.size(); ++p)
+		for (size_t p = 0; p < pts.size(); ++p) {
 			push_pt(p, 0);
+		}
 		r.npts = pts.size();
 	} else {
-		for (size_t c = 0; c < corners; ++c)
+		for (size_t c = 0; c < corners; ++c) {
 			push_pt((size_t)fvi[c], c);
+		}
 		r.npts = corners;
 	}
 	// triangles: a fan per face (corner 0, i, i+1), reversed for leftHanded, in face order
 	// within each group and the groups one after another
 	std::vector<size_t> first_corner(fvc.size());
-	for (size_t f = 0, c0 = 0; f < fvc.size(); c0 += (size_t)fvc[f], ++f)
+	for (size_t f = 0, c0 = 0; f < fvc.size(); c0 += (size_t)fvc[f], ++f) {
 		first_corner[f] = c0;
+	}
 	r.surf_off = g_surfaces.size();
 	for (size_t g = 0; g < group_mat.size(); ++g) {
 		const size_t first = r.ntris;
 		for (size_t f = 0; f < fvc.size(); ++f) {
 			const size_t n = (size_t)fvc[f];
 			const size_t c0 = first_corner[f];
-			if ((size_t)face_group[f] != g || hole[f] || n < 3)
+			if ((size_t)face_group[f] != g || hole[f] || n < 3) {
 				continue;
+			}
 			for (size_t i = 1; i + 1 < n; ++i) {
 				int32_t a = r.indexed ? fvi[c0] : (int32_t)c0;
 				int32_t b = r.indexed ? fvi[c0 + i] : (int32_t)(c0 + i);
 				int32_t c = r.indexed ? fvi[c0 + i + 1] : (int32_t)(c0 + i + 1);
-				if (flip)
+				if (flip) {
 					std::swap(b, c);
+				}
 				g_indices.push_back(a);
 				g_indices.push_back(b);
 				g_indices.push_back(c);
@@ -702,14 +763,16 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 	matrix_to16(xc.GetLocalToWorldTransform(prim), r.xf);
 	if (skin) {
 		const std::string err = add_skin(*skin, pts.size(), fvi, r);
-		if (!err.empty())
+		if (!err.empty()) {
 			return err;
+		}
 	}
 
 	if (prim.HasAPI<UsdSkelBindingAPI>()) {
 		const std::string err = add_blend_shapes(prim, pts.size(), fvi, r);
-		if (!err.empty())
+		if (!err.empty()) {
 			return err;
+		}
 	}
 	r.material = group_mat[0];
 	g_meshes.push_back(r);
@@ -724,18 +787,21 @@ std::string add_curves(const UsdPrim &prim, UsdGeomXformCache &xc) {
 	bc.GetCurveVertexCountsAttr().Get(&counts, UsdTimeCode::Default());
 	size_t total = 0;
 	for (int c : counts) {
-		if (c < 2)
+		if (c < 2) {
 			return "a curve has " + std::to_string(c) + " point(s); a stroke needs 2 or more";
+		}
 		total += (size_t)c;
 	}
-	if (total != pts.size())
+	if (total != pts.size()) {
 		return "curveVertexCounts sum " + std::to_string(total) + " != points " + std::to_string(pts.size());
+	}
 	bool boundary = false;
 	UsdGeomPrimvar pv = UsdGeomPrimvarsAPI(prim).GetPrimvar(TfToken("boundary"));
 	if (pv && pv.HasAuthoredValue()) {
 		bool v = false;
-		if (pv.Get(&v, UsdTimeCode::Default()))
+		if (pv.Get(&v, UsdTimeCode::Default())) {
 			boundary = v;
+		}
 	}
 	const GfMatrix4d m = xc.GetLocalToWorldTransform(prim);
 	const std::string name = prim.GetName().GetString();
@@ -755,9 +821,11 @@ std::string add_curves(const UsdPrim &prim, UsdGeomXformCache &xc) {
 		at += r.npts;
 		r.boundary = boundary;
 		r.b3_p = intern(blake3::hex(g_cpoints.data() + r.pt_off * 3, r.npts * 3 * sizeof(float)));
-		for (int i = 0; i < 4; ++i)
-			for (int j = 0; j < 4; ++j)
+		for (int i = 0; i < 4; ++i) {
+			for (int j = 0; j < 4; ++j) {
 				r.xf[i * 4 + j] = (float)m[i][j];
+			}
+		}
 		g_curves.push_back(r);
 	}
 	return "";
@@ -766,9 +834,11 @@ std::string add_curves(const UsdPrim &prim, UsdGeomXformCache &xc) {
 // GfMatrix4d is row-vector (p' = p M): its upper 3x3 is the transpose of the
 // column-vector rotation the tables hold, and its row 3 is the translation.
 void matrix_to12(const GfMatrix4d &m, float *o) {
-	for (int r = 0; r < 3; ++r)
-		for (int c = 0; c < 3; ++c)
+	for (int r = 0; r < 3; ++r) {
+		for (int c = 0; c < 3; ++c) {
 			o[r * 3 + c] = (float)m[c][r];
+		}
+	}
 	o[9] = (float)m[3][0];
 	o[10] = (float)m[3][1];
 	o[11] = (float)m[3][2];
@@ -785,17 +855,20 @@ double short_double(float f) {
 	for (int p = 6; p <= 9; ++p) {
 		std::snprintf(buf, sizeof buf, "%.*g", p, (double)f);
 		const double d = std::strtod(buf, nullptr);
-		if ((float)d == f)
+		if ((float)d == f) {
 			return d;
+		}
 	}
 	return (double)f;
 }
 
 GfMatrix4d matrix_from12(const float *o) {
 	GfMatrix4d m(1.0);
-	for (int r = 0; r < 3; ++r)
-		for (int c = 0; c < 3; ++c)
+	for (int r = 0; r < 3; ++r) {
+		for (int c = 0; c < 3; ++c) {
 			m[c][r] = short_double(o[r * 3 + c]);
+		}
+	}
 	m[3][0] = short_double(o[9]);
 	m[3][1] = short_double(o[10]);
 	m[3][2] = short_double(o[11]);
@@ -804,9 +877,11 @@ GfMatrix4d matrix_from12(const float *o) {
 
 GfMatrix4d matrix_exact12(const float *o) {
 	GfMatrix4d m(1.0);
-	for (int r = 0; r < 3; ++r)
-		for (int c = 0; c < 3; ++c)
+	for (int r = 0; r < 3; ++r) {
+		for (int c = 0; c < 3; ++c) {
 			m[c][r] = o[r * 3 + c];
+		}
+	}
 	m[3][0] = o[9];
 	m[3][1] = o[10];
 	m[3][2] = o[11];
@@ -819,30 +894,35 @@ GfMatrix4d matrix_exact12(const float *o) {
 std::string add_skeleton(const UsdPrim &prim, const UsdSkelCache &cache, UsdGeomXformCache &xc) {
 	UsdSkelSkeleton skel(prim);
 	UsdSkelSkeletonQuery q = cache.GetSkelQuery(skel);
-	if (!q)
+	if (!q) {
 		return "no skeleton query";
+	}
 	const VtTokenArray joints = q.GetJointOrder();
 	const size_t J = joints.size();
 	const UsdSkelTopology &topo = q.GetTopology();
 	std::string why;
-	if (J == 0 || !topo.Validate(&why))
+	if (J == 0 || !topo.Validate(&why)) {
 		return "topology: " + (J == 0 ? std::string("no joints") : why);
+	}
 	const VtIntArray &parents = topo.GetParentIndices();
 	VtMatrix4dArray bind, rest;
 	const bool has_bind = q.GetJointWorldBindTransforms(&bind) && bind.size() == J;
 	const bool has_rest = q.HasRestPose() && q.ComputeJointLocalTransforms(&rest, UsdTimeCode::Default(), true) && rest.size() == J;
-	if (!has_bind && !has_rest)
+	if (!has_bind && !has_rest) {
 		return "neither bindTransforms nor restTransforms for " + std::to_string(J) + " joints";
+	}
 	SkelRec r;
 	if (!has_rest) {
 		rest.resize(J);
-		for (size_t j = 0; j < J; ++j)
+		for (size_t j = 0; j < J; ++j) {
 			rest[j] = parents[j] < 0 ? bind[j] : bind[j] * bind[(size_t)parents[j]].GetInverse();
+		}
 		r.rest_from_bind = true;
 	}
 	if (!has_bind) {
-		if (!q.ComputeJointSkelTransforms(&bind, UsdTimeCode::Default(), true) || bind.size() != J)
+		if (!q.ComputeJointSkelTransforms(&bind, UsdTimeCode::Default(), true) || bind.size() != J) {
 			return "no bind pose and the rest does not compose";
+		}
 		r.bind_from_rest = true;
 	}
 	r.path = intern(prim.GetPath().GetString());
@@ -879,8 +959,9 @@ std::string add_skeleton(const UsdPrim &prim, const UsdSkelCache &cache, UsdGeom
 std::string add_anim(const UsdPrim &prim, double fps) {
 	UsdSkelCache cache;
 	UsdSkelAnimQuery q = cache.GetAnimQuery(prim);
-	if (!q)
+	if (!q) {
 		return "no anim query";
+	}
 	// Frames are the union of the joint and the blend-shape-weight time samples
 	// (interactor-flow AnimationConverter.h): a face clip may animate weights only.
 	std::vector<double> times, bw_times;
@@ -894,13 +975,15 @@ std::string add_anim(const UsdPrim &prim, double fps) {
 	AnimRec r;
 	r.path = intern(prim.GetPath().GetString());
 	std::string jl;
-	for (const TfToken &t : joints)
+	for (const TfToken &t : joints) {
 		jl += t.GetString() + "\n";
+	}
 	r.joints = intern(jl);
 	r.njoints = joints.size();
 	std::string sl, tl;
-	for (const TfToken &t : shapes)
+	for (const TfToken &t : shapes) {
 		sl += t.GetString() + "\n";
+	}
 	r.shapes = intern(sl);
 	r.nshapes = shapes.size();
 	r.fps = fps;
@@ -910,20 +993,24 @@ std::string add_anim(const UsdPrim &prim, double fps) {
 		tl += TfStringify(t) + "\n";
 		if (!shapes.empty()) {
 			VtFloatArray w;
-			if (!q.ComputeBlendShapeWeights(&w, UsdTimeCode(t)) || w.size() != shapes.size())
+			if (!q.ComputeBlendShapeWeights(&w, UsdTimeCode(t)) || w.size() != shapes.size()) {
 				return "blend shape weights for " + std::to_string(w.size()) + " of " + std::to_string(shapes.size()) +
 						" shapes at time " + std::to_string(t);
+			}
 			g_anim_bw.insert(g_anim_bw.end(), w.begin(), w.end());
 		}
 		VtMatrix4dArray xf;
-		if (!joints.empty() && !q.ComputeJointLocalTransforms(&xf, UsdTimeCode(t)))
+		if (!joints.empty() && !q.ComputeJointLocalTransforms(&xf, UsdTimeCode(t))) {
 			return "ComputeJointLocalTransforms failed at time " + std::to_string(t);
-		if (xf.size() != joints.size())
+		}
+		if (xf.size() != joints.size()) {
 			return "transforms for " + std::to_string(xf.size()) + " of " + std::to_string(joints.size()) + " joints";
+		}
 		const size_t at = g_animxf.size();
 		g_animxf.resize(at + xf.size() * 12);
-		for (size_t j = 0; j < xf.size(); ++j)
+		for (size_t j = 0; j < xf.size(); ++j) {
 			matrix_to12(xf[j], &g_animxf[at + j * 12]);
+		}
 		++r.frames;
 	}
 	r.times = intern(tl);
@@ -1013,8 +1100,9 @@ static std::string open_stage(const char *ext, size_t nbytes) {
 		std::map<std::string, SkinSrc> skinned;
 		size_t bound = 0;
 		for (const UsdPrim &prim : stage->Traverse()) {
-			if (!prim.IsA<UsdSkelSkeleton>())
+			if (!prim.IsA<UsdSkelSkeleton>()) {
 				continue;
+			}
 			const std::string err = add_skeleton(prim, skel_cache, xc);
 			if (!err.empty()) {
 				std::string e = "ERR: skeleton " + prim.GetPath().GetString() + ": " + err;
@@ -1023,20 +1111,24 @@ static std::string open_stage(const char *ext, size_t nbytes) {
 			}
 		}
 		for (const UsdPrim &prim : stage->Traverse()) {
-			if (prim.HasAPI<UsdSkelBindingAPI>() && prim.IsA<UsdGeomMesh>())
+			if (prim.HasAPI<UsdSkelBindingAPI>() && prim.IsA<UsdGeomMesh>()) {
 				++bound;
-			if (!prim.IsA<UsdSkelRoot>())
+			}
+			if (!prim.IsA<UsdSkelRoot>()) {
 				continue;
+			}
 			const UsdSkelRoot root(prim);
 			std::vector<UsdSkelBinding> bindings;
 			skel_cache.Populate(root, UsdPrimDefaultPredicate);
 			skel_cache.ComputeSkelBindings(root, &bindings, UsdPrimDefaultPredicate);
 			for (const UsdSkelBinding &b : bindings) {
 				std::map<std::string, int>::const_iterator s = g_skel_by_path.find(b.GetSkeleton().GetPath().GetString());
-				if (s == g_skel_by_path.end())
+				if (s == g_skel_by_path.end()) {
 					continue;
-				for (const UsdSkelSkinningQuery &q : b.GetSkinningTargets())
+				}
+				for (const UsdSkelSkinningQuery &q : b.GetSkinningTargets()) {
 					skinned[q.GetPrim().GetPath().GetString()] = SkinSrc{ q, s->second };
+				}
 			}
 		}
 		for (const UsdPrim &prim : stage->Traverse()) {
@@ -1059,8 +1151,9 @@ static std::string open_stage(const char *ext, size_t nbytes) {
 				}
 				continue;
 			}
-			if (!prim.IsA<UsdGeomMesh>())
+			if (!prim.IsA<UsdGeomMesh>()) {
 				continue;
+			}
 			std::string mwarn;
 			std::map<std::string, SkinSrc>::const_iterator sk = skinned.find(prim.GetPath().GetString());
 			std::string err = add_mesh(prim, xc, g_pkg_path, sk == skinned.end() ? nullptr : &sk->second, mwarn);
@@ -1069,8 +1162,9 @@ static std::string open_stage(const char *ext, size_t nbytes) {
 				close();
 				return e;
 			}
-			if (!mwarn.empty() && warn.empty())
+			if (!mwarn.empty() && warn.empty()) {
 				warn = prim.GetName().GetString() + ": " + mwarn;
+			}
 		}
 		skins_unbound = bound > g_skins.size() ? bound - g_skins.size() : 0;
 		// The stage and layer go out of scope here; the flat tables stay.
@@ -1081,30 +1175,36 @@ static std::string open_stage(const char *ext, size_t nbytes) {
 	}
 	char buf[360];
 	std::snprintf(buf, sizeof buf, "ok layer=%s prims=%zu meshes=%zu curves=%zu materials=%zu textures=%zu up=%s mpu=%g bytes=%zu anims=%zu skels=%zu skins=%zu skins_unbound=%zu textures_missing=%zu blend_shapes=%zu",
-				ext, prims, g_meshes.size(), g_curves.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, nbytes, g_anims.size(),
+			ext, prims, g_meshes.size(), g_curves.size(), g_mats.size(), g_texs.size(), up.c_str(), mpu, nbytes, g_anims.size(),
 			g_skels.size(), g_skins.size(), skins_unbound, g_tex_missing.size(), g_shapes.size());
 	std::string out = buf;
-	if (!g_tex_missing.empty())
+	if (!g_tex_missing.empty()) {
 		out += " missing=" + TfStringJoin(g_tex_missing, ",");
-	if (!warn.empty())
+	}
+	if (!warn.empty()) {
 		out += " warn=" + warn;
-	if (!mark.IsClean())
+	}
+	if (!mark.IsClean()) {
 		out += " usd_error=" + first_error(mark);
+	}
 	return out;
 }
 
 std::string open(const std::string &bytes) {
 	close();
 	const std::string init = usdmem::init();
-	if (init.compare(0, 3, "ok ") != 0)
+	if (init.compare(0, 3, "ok ") != 0) {
 		return "ERR: init: " + init;
-	if (bytes.empty())
+	}
+	if (bytes.empty()) {
 		return "ERR: empty package";
+	}
 	const char *ext = "usda";
-	if (bytes.size() >= 4 && std::memcmp(bytes.data(), "PK\x03\x04", 4) == 0)
+	if (bytes.size() >= 4 && std::memcmp(bytes.data(), "PK\x03\x04", 4) == 0) {
 		ext = "usdz";
-	else if (bytes.size() >= 8 && std::memcmp(bytes.data(), "PXR-USDC", 8) == 0)
+	} else if (bytes.size() >= 8 && std::memcmp(bytes.data(), "PXR-USDC", 8) == 0) {
 		ext = "usdc";
+	}
 	static int serial = 0;
 	g_pkg_path = "/mem/pkg" + std::to_string(++serial) + "." + ext;
 	g_pkg_owned = true;
@@ -1126,19 +1226,22 @@ static std::string asset_full(const std::string &rel) {
 }
 
 std::string asset_put(const std::string &rel, const std::string &bytes) {
-	if (rel.empty())
+	if (rel.empty()) {
 		return "ERR: asset_put: empty path";
+	}
 	usdmem::put_asset(asset_full(rel), bytes.data(), bytes.size());
-	if (std::find(g_stream.begin(), g_stream.end(), rel) == g_stream.end())
+	if (std::find(g_stream.begin(), g_stream.end(), rel) == g_stream.end()) {
 		g_stream.push_back(rel);
+	}
 	char buf[96];
 	std::snprintf(buf, sizeof buf, "ok path=%s bytes=%zu", rel.c_str(), bytes.size());
 	return buf;
 }
 
 std::string asset_push(const std::string &rel, const std::string &chunk) {
-	if (rel.empty())
+	if (rel.empty()) {
 		return "ERR: asset_push: empty path";
+	}
 	std::string &buf = g_stage[rel];
 	buf.append(chunk);
 	char out[128];
@@ -1148,8 +1251,9 @@ std::string asset_push(const std::string &rel, const std::string &chunk) {
 
 std::string asset_end(const std::string &rel) {
 	std::map<std::string, std::string>::iterator it = g_stage.find(rel);
-	if (it == g_stage.end())
+	if (it == g_stage.end()) {
 		return "ERR: asset_end: nothing staged at " + rel;
+	}
 	const std::string r = asset_put(rel, it->second);
 	g_stage.erase(it);
 	return r;
@@ -1158,47 +1262,63 @@ std::string asset_end(const std::string &rel) {
 std::string open_asset(const std::string &rel) {
 	close();
 	const std::string init = usdmem::init();
-	if (init.compare(0, 3, "ok ") != 0)
+	if (init.compare(0, 3, "ok ") != 0) {
 		return "ERR: init: " + init;
+	}
 	const std::string full = asset_full(rel);
 	const long n = usdmem::asset_size(full);
-	if (n < 0)
+	if (n < 0) {
 		return "ERR: no asset at " + rel;
+	}
 	const char *ext = "usda";
-	if (rel.size() >= 5 && rel.compare(rel.size() - 5, 5, ".usdz") == 0)
+	if (rel.size() >= 5 && rel.compare(rel.size() - 5, 5, ".usdz") == 0) {
 		ext = "usdz";
-	else if (rel.size() >= 5 && rel.compare(rel.size() - 5, 5, ".usdc") == 0)
+	} else if (rel.size() >= 5 && rel.compare(rel.size() - 5, 5, ".usdc") == 0) {
 		ext = "usdc";
+	}
 	g_pkg_path = full;
 	g_pkg_owned = false;
 	return open_stage(ext, (size_t)n);
 }
 
 void asset_clear() {
-	for (size_t i = 0; i < g_stream.size(); ++i)
+	for (size_t i = 0; i < g_stream.size(); ++i) {
 		usdmem::erase_asset(asset_full(g_stream[i]));
+	}
 	g_stream.clear();
 	g_stage.clear();
 }
 
-std::vector<std::string> asset_list() { return g_stream; }
+std::vector<std::string> asset_list() {
+	return g_stream;
+}
 
 void close() {
-	if (g_pkg_owned && !g_pkg_path.empty())
+	if (g_pkg_owned && !g_pkg_path.empty()) {
 		usdmem::erase_asset(g_pkg_path);
+	}
 	g_pkg_path.clear();
 	g_pkg_owned = false;
 	clear_tables();
 }
 
-int mesh_count() { return (int)g_meshes.size(); }
-int curve_count() { return (int)g_curves.size(); }
-int material_count() { return (int)g_mats.size(); }
-int texture_count() { return (int)g_texs.size(); }
+int mesh_count() {
+	return (int)g_meshes.size();
+}
+int curve_count() {
+	return (int)g_curves.size();
+}
+int material_count() {
+	return (int)g_mats.size();
+}
+int texture_count() {
+	return (int)g_texs.size();
+}
 
 bool mesh_info(int i, MeshInfo &out) {
-	if (i < 0 || (size_t)i >= g_meshes.size())
+	if (i < 0 || (size_t)i >= g_meshes.size()) {
 		return false;
+	}
 	const MeshRec &r = g_meshes[i];
 	out.path = str(r.path);
 	out.name = str(r.name);
@@ -1219,11 +1339,14 @@ bool mesh_info(int i, MeshInfo &out) {
 	return true;
 }
 
-int blend_shape_count() { return (int)g_shapes.size(); }
+int blend_shape_count() {
+	return (int)g_shapes.size();
+}
 
 bool blend_shape_info(int k, BlendShapeInfo &out) {
-	if (k < 0 || (size_t)k >= g_shapes.size())
+	if (k < 0 || (size_t)k >= g_shapes.size()) {
 		return false;
+	}
 	const ShapeRec &r = g_shapes[(size_t)k];
 	out.name = str(r.name);
 	out.mesh = r.mesh;
@@ -1237,25 +1360,30 @@ bool blend_shape_info(int k, BlendShapeInfo &out) {
 
 const float *blend_shape_offsets(int k, size_t &n_points) {
 	n_points = 0;
-	if (k < 0 || (size_t)k >= g_shapes.size())
+	if (k < 0 || (size_t)k >= g_shapes.size()) {
 		return nullptr;
+	}
 	n_points = g_meshes[(size_t)g_shapes[(size_t)k].mesh].npts;
 	return g_shape_off.data() + g_shapes[(size_t)k].off;
 }
 
 const float *blend_shape_normals(int k, size_t &n_points) {
 	n_points = 0;
-	if (k < 0 || (size_t)k >= g_shapes.size() || !g_shapes[(size_t)k].has_normals)
+	if (k < 0 || (size_t)k >= g_shapes.size() || !g_shapes[(size_t)k].has_normals) {
 		return nullptr;
+	}
 	n_points = g_meshes[(size_t)g_shapes[(size_t)k].mesh].npts;
 	return g_shape_nrm.data() + g_shapes[(size_t)k].nrm_off;
 }
 
-int skeleton_count() { return (int)g_skels.size(); }
+int skeleton_count() {
+	return (int)g_skels.size();
+}
 
 bool skeleton_info(int i, SkeletonInfo &out) {
-	if (i < 0 || (size_t)i >= g_skels.size())
+	if (i < 0 || (size_t)i >= g_skels.size()) {
 		return false;
+	}
 	const SkelRec &r = g_skels[i];
 	out.path = str(r.path);
 	out.joints = str(r.joints);
@@ -1269,22 +1397,25 @@ bool skeleton_info(int i, SkeletonInfo &out) {
 }
 
 const float *skeleton_binds(int i, size_t &n) {
-	if (i < 0 || (size_t)i >= g_skels.size())
+	if (i < 0 || (size_t)i >= g_skels.size()) {
 		return nullptr;
+	}
 	n = g_skels[i].njoints;
 	return g_skel_bind.data() + g_skels[i].xf_off;
 }
 
 const float *skeleton_rests(int i, size_t &n) {
-	if (i < 0 || (size_t)i >= g_skels.size())
+	if (i < 0 || (size_t)i >= g_skels.size()) {
 		return nullptr;
+	}
 	n = g_skels[i].njoints;
 	return g_skel_rest.data() + g_skels[i].xf_off;
 }
 
 bool mesh_skin(int i, SkinInfo &out) {
-	if (i < 0 || (size_t)i >= g_meshes.size() || g_meshes[i].skin < 0)
+	if (i < 0 || (size_t)i >= g_meshes.size() || g_meshes[i].skin < 0) {
 		return false;
+	}
 	const SkinRec &k = g_skins[(size_t)g_meshes[i].skin];
 	out.skeleton = k.skel;
 	out.element_size = k.element;
@@ -1299,15 +1430,17 @@ bool mesh_skin(int i, SkinInfo &out) {
 }
 
 const int32_t *mesh_skin_indices(int i, size_t &n) {
-	if (i < 0 || (size_t)i >= g_meshes.size() || g_meshes[i].skin < 0)
+	if (i < 0 || (size_t)i >= g_meshes.size() || g_meshes[i].skin < 0) {
 		return nullptr;
+	}
 	n = g_meshes[i].npts;
 	return g_skin_idx.data() + g_skins[(size_t)g_meshes[i].skin].off;
 }
 
 const float *mesh_skin_weights(int i, size_t &n) {
-	if (i < 0 || (size_t)i >= g_meshes.size() || g_meshes[i].skin < 0)
+	if (i < 0 || (size_t)i >= g_meshes.size() || g_meshes[i].skin < 0) {
 		return nullptr;
+	}
 	n = g_meshes[i].npts;
 	return g_skin_w.data() + g_skins[(size_t)g_meshes[i].skin].off;
 }
@@ -1326,31 +1459,37 @@ std::vector<float> mesh_skin_pose(int i, const float *local, size_t n_joints, bo
 		return out;
 	}
 	VtIntArray parents(s.njoints);
-	for (size_t j = 0; j < s.njoints; ++j)
+	for (size_t j = 0; j < s.njoints; ++j) {
 		parents[j] = g_skel_parents[s.par_off + j];
+	}
 	const UsdSkelTopology topo(parents);
 	std::vector<GfMatrix4d> loc(s.njoints), skel_xf(s.njoints), skin_xf(s.njoints);
-	for (size_t j = 0; j < s.njoints; ++j)
+	for (size_t j = 0; j < s.njoints; ++j) {
 		loc[j] = matrix_exact12(local + j * 12);
+	}
 	if (!UsdSkelConcatJointTransforms(topo, TfSpan<const GfMatrix4d>(loc), TfSpan<GfMatrix4d>(skel_xf))) {
 		why = "the joint transforms do not compose";
 		return out;
 	}
-	for (size_t j = 0; j < s.njoints; ++j)
+	for (size_t j = 0; j < s.njoints; ++j) {
 		skin_xf[j] = matrix_exact12(&g_skel_bind[s.xf_off + j * 12]).GetInverse() * skel_xf[j];
+	}
 	GfMatrix4d geom, world;
-	for (int r = 0; r < 4; ++r)
+	for (int r = 0; r < 4; ++r) {
 		for (int c = 0; c < 4; ++c) {
 			geom[r][c] = k.geom[r * 4 + c];
 			world[r][c] = s.xf[r * 4 + c];
 		}
+	}
 	std::vector<GfVec3f> pts(m.npts);
-	for (size_t v = 0; v < m.npts; ++v)
+	for (size_t v = 0; v < m.npts; ++v) {
 		pts[v] = GfVec3f(g_points[m.pt_off + v * 3], g_points[m.pt_off + v * 3 + 1], g_points[m.pt_off + v * 3 + 2]);
+	}
 	const size_t n = m.npts * (size_t)k.element;
 	std::vector<float> w(g_skin_w.begin() + (long)k.off, g_skin_w.begin() + (long)(k.off + n));
-	if (normalize)
+	if (normalize) {
 		UsdSkelNormalizeWeights(TfSpan<float>(w), k.element);
+	}
 	if (!UsdSkelSkinPointsLBS(geom, TfSpan<const GfMatrix4d>(skin_xf), TfSpan<const int>(g_skin_idx.data() + k.off, n),
 				TfSpan<const float>(w), k.element, TfSpan<GfVec3f>(pts), true)) {
 		why = "UsdSkelSkinPointsLBS failed";
@@ -1367,36 +1506,41 @@ std::vector<float> mesh_skin_pose(int i, const float *local, size_t n_joints, bo
 }
 
 const float *mesh_points(int i, size_t &n) {
-	if (i < 0 || (size_t)i >= g_meshes.size())
+	if (i < 0 || (size_t)i >= g_meshes.size()) {
 		return nullptr;
+	}
 	n = g_meshes[i].npts;
 	return g_points.data() + g_meshes[i].pt_off;
 }
 
 const float *mesh_normals(int i, size_t &n) {
-	if (i < 0 || (size_t)i >= g_meshes.size() || !g_meshes[i].has_normals)
+	if (i < 0 || (size_t)i >= g_meshes.size() || !g_meshes[i].has_normals) {
 		return nullptr;
+	}
 	n = g_meshes[i].npts;
 	return g_normals.data() + g_meshes[i].nrm_off;
 }
 
 const float *mesh_uvs(int i, size_t &n) {
-	if (i < 0 || (size_t)i >= g_meshes.size() || !g_meshes[i].has_uvs)
+	if (i < 0 || (size_t)i >= g_meshes.size() || !g_meshes[i].has_uvs) {
 		return nullptr;
+	}
 	n = g_meshes[i].npts;
 	return g_uvs.data() + g_meshes[i].uv_off;
 }
 
 const int32_t *mesh_indices(int i, size_t &n) {
-	if (i < 0 || (size_t)i >= g_meshes.size())
+	if (i < 0 || (size_t)i >= g_meshes.size()) {
 		return nullptr;
+	}
 	n = g_meshes[i].ntris;
 	return g_indices.data() + g_meshes[i].idx_off;
 }
 
 bool material_info(int i, MaterialInfo &out) {
-	if (i < 0 || (size_t)i >= g_mats.size())
+	if (i < 0 || (size_t)i >= g_mats.size()) {
 		return false;
+	}
 	const MatRec &m = g_mats[i];
 	out.path = str(m.path);
 	out.name = str(m.name);
@@ -1415,14 +1559,16 @@ bool material_info(int i, MaterialInfo &out) {
 	out.roughness_channel = str(m.channel[2]);
 	out.opacity_channel = str(m.channel[3]);
 	out.normal_channel = str(m.channel[4]);
-	for (int k = 0; k < 5; k++)
+	for (int k = 0; k < 5; k++) {
 		out.file[k] = str(m.file[k]);
+	}
 	return true;
 }
 
 bool texture_info(int i, TextureInfo &out) {
-	if (i < 0 || (size_t)i >= g_texs.size())
+	if (i < 0 || (size_t)i >= g_texs.size()) {
 		return false;
+	}
 	out.path = str(g_texs[i].path);
 	out.file = str(g_texs[i].file);
 	out.size = g_texs[i].size;
@@ -1430,15 +1576,17 @@ bool texture_info(int i, TextureInfo &out) {
 }
 
 const uint8_t *texture_bytes(int i, size_t &n) {
-	if (i < 0 || (size_t)i >= g_texs.size())
+	if (i < 0 || (size_t)i >= g_texs.size()) {
 		return nullptr;
+	}
 	n = g_texs[i].size;
 	return g_texdata.data() + g_texs[i].data_off;
 }
 
 bool curve_info(int i, CurveInfo &out) {
-	if (i < 0 || (size_t)i >= g_curves.size())
+	if (i < 0 || (size_t)i >= g_curves.size()) {
 		return false;
+	}
 	const CurveRec &r = g_curves[i];
 	out.path = str(r.path);
 	out.name = str(r.name);
@@ -1454,8 +1602,9 @@ const std::vector<std::pair<std::string, std::string>> &layer_data() {
 }
 
 const float *curve_points(int i, size_t &n) {
-	if (i < 0 || (size_t)i >= g_curves.size())
+	if (i < 0 || (size_t)i >= g_curves.size()) {
 		return nullptr;
+	}
 	n = g_curves[i].npts;
 	return g_cpoints.data() + g_curves[i].pt_off * 3;
 }
@@ -1464,22 +1613,27 @@ std::string write_curves(const float *points, size_t n_points, const int32_t *co
 		const std::vector<std::string> &names, const std::vector<int32_t> &boundary,
 		const std::vector<std::pair<std::string, std::string>> &meta) {
 	const std::string init = usdmem::init();
-	if (init.compare(0, 3, "ok ") != 0)
+	if (init.compare(0, 3, "ok ") != 0) {
 		return "ERR: init: " + init;
-	if (!names.empty() && names.size() != n_curves)
+	}
+	if (!names.empty() && names.size() != n_curves) {
 		return "ERR: " + std::to_string(names.size()) + " names for " + std::to_string(n_curves) + " curves";
+	}
 	size_t total = 0;
 	for (size_t k = 0; k < n_curves; ++k) {
-		if (counts[k] < 2)
+		if (counts[k] < 2) {
 			return "ERR: curve " + std::to_string(k) + " has " + std::to_string(counts[k]) + " point(s); a stroke needs 2 or more";
+		}
 		total += (size_t)counts[k];
 	}
-	if (total != n_points)
+	if (total != n_points) {
 		return "ERR: counts sum " + std::to_string(total) + " != points " + std::to_string(n_points);
+	}
 	std::vector<char> marked(n_curves, 0);
 	for (int32_t b : boundary) {
-		if (b < 0 || (size_t)b >= n_curves)
+		if (b < 0 || (size_t)b >= n_curves) {
 			return "ERR: boundary index " + std::to_string(b) + " out of range";
+		}
 		marked[(size_t)b] = 1;
 	}
 	TfErrorMark mark;
@@ -1490,46 +1644,52 @@ std::string write_curves(const float *points, size_t n_points, const int32_t *co
 		UsdGeomXform root = UsdGeomXform::Define(stage, SdfPath("/Creation"));
 		stage->SetDefaultPrim(root.GetPrim());
 		VtDictionary cld;
-		for (const std::pair<std::string, std::string> &kv : meta)
+		for (const std::pair<std::string, std::string> &kv : meta) {
 			cld[kv.first] = VtValue(kv.second);
+		}
 		stage->GetRootLayer()->SetCustomLayerData(cld);
 		size_t at = 0;
 		for (size_t k = 0; k < n_curves; ++k) {
 			char dflt[32];
 			std::snprintf(dflt, sizeof dflt, "stroke_%03zu", k);
 			const std::string name = names.empty() ? std::string(dflt) : names[k];
-			if (!SdfPath::IsValidIdentifier(name))
+			if (!SdfPath::IsValidIdentifier(name)) {
 				return "ERR: curve " + std::to_string(k) + ": '" + name + "' is not a valid prim name";
+			}
 			UsdGeomBasisCurves bc = UsdGeomBasisCurves::Define(stage, SdfPath("/Creation/" + name));
 			bc.CreateTypeAttr(VtValue(UsdGeomTokens->linear));
 			VtVec3fArray pts((size_t)counts[k]);
-			for (size_t i = 0; i < pts.size(); ++i)
+			for (size_t i = 0; i < pts.size(); ++i) {
 				pts[i] = GfVec3f(points[(at + i) * 3], points[(at + i) * 3 + 1], points[(at + i) * 3 + 2]);
+			}
 			at += pts.size();
 			bc.CreatePointsAttr(VtValue(pts));
 			VtIntArray cvc(1, counts[k]);
 			bc.CreateCurveVertexCountsAttr(VtValue(cvc));
 			if (marked[k]) {
 				UsdGeomPrimvar pv = UsdGeomPrimvarsAPI(bc.GetPrim())
-						.CreatePrimvar(TfToken("boundary"), SdfValueTypeNames->Bool, UsdGeomTokens->uniform);
+											.CreatePrimvar(TfToken("boundary"), SdfValueTypeNames->Bool, UsdGeomTokens->uniform);
 				pv.Set(true);
 			}
 		}
 		std::string text;
-		if (!stage->GetRootLayer()->ExportToString(&text))
+		if (!stage->GetRootLayer()->ExportToString(&text)) {
 			return "ERR: export failed: " + first_error(mark);
+		}
 		return text;
 	} catch (const std::exception &e) {
 		return std::string("ERR: write exception: ") + e.what();
 	}
 }
 
-
-int skel_anim_count() { return (int)g_anims.size(); }
+int skel_anim_count() {
+	return (int)g_anims.size();
+}
 
 bool skel_anim_info(int i, SkelAnimInfo &out) {
-	if (i < 0 || (size_t)i >= g_anims.size())
+	if (i < 0 || (size_t)i >= g_anims.size()) {
 		return false;
+	}
 	const AnimRec &r = g_anims[i];
 	out.path = str(r.path);
 	out.joints = str(r.joints);
@@ -1544,8 +1704,9 @@ bool skel_anim_info(int i, SkelAnimInfo &out) {
 
 const float *skel_anim_blend_weights(int i, size_t &n_floats) {
 	n_floats = 0;
-	if (i < 0 || (size_t)i >= g_anims.size())
+	if (i < 0 || (size_t)i >= g_anims.size()) {
 		return nullptr;
+	}
 	n_floats = g_anims[i].frames * g_anims[i].nshapes;
 	static const float none = 0.0f; // a clip without weights answers an empty array, not "no animation"
 	return n_floats ? g_anim_bw.data() + g_anims[i].bw_off : &none;
@@ -1553,8 +1714,9 @@ const float *skel_anim_blend_weights(int i, size_t &n_floats) {
 
 const float *skel_anim_transforms(int i, size_t &n_floats) {
 	n_floats = 0;
-	if (i < 0 || (size_t)i >= g_anims.size())
+	if (i < 0 || (size_t)i >= g_anims.size()) {
 		return nullptr;
+	}
 	n_floats = g_anims[i].frames * g_anims[i].njoints * 12;
 	return g_animxf.data() + g_anims[i].xf_off;
 }
@@ -1564,39 +1726,50 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 		const float *anim_local, size_t frames, double fps,
 		const std::vector<std::pair<std::string, std::string>> &meta) {
 	const std::string init = usdmem::init();
-	if (init.compare(0, 3, "ok ") != 0)
+	if (init.compare(0, 3, "ok ") != 0) {
 		return "ERR: init: " + init;
+	}
 	const size_t J = names.size();
-	if (parents.size() != J)
+	if (parents.size() != J) {
 		return "ERR: " + std::to_string(parents.size()) + " parents for " + std::to_string(J) + " joints";
-	if (!(fps > 0.0) || frames == 0)
+	}
+	if (!(fps > 0.0) || frames == 0) {
 		return "ERR: a clip needs frames and a positive fps";
-	for (int32_t a : anim_joints)
-		if (a < 0 || (size_t)a >= J)
+	}
+	for (int32_t a : anim_joints) {
+		if (a < 0 || (size_t)a >= J) {
 			return "ERR: animated joint " + std::to_string(a) + " out of range";
+		}
+	}
 	// UsdSkel orders parents before children; take a depth-first order.
 	std::vector<std::vector<size_t>> kids(J);
 	std::vector<size_t> order, rank(J, 0);
 	for (size_t j = 0; j < J; ++j) {
-		if (parents[j] >= (int32_t)J)
+		if (parents[j] >= (int32_t)J) {
 			return "ERR: joint " + std::to_string(j) + " has parent " + std::to_string(parents[j]);
-		if (parents[j] >= 0)
+		}
+		if (parents[j] >= 0) {
 			kids[(size_t)parents[j]].push_back(j);
+		}
 	}
 	std::vector<size_t> stack;
-	for (size_t j = J; j-- > 0;)
-		if (parents[j] < 0)
+	for (size_t j = J; j-- > 0;) {
+		if (parents[j] < 0) {
 			stack.push_back(j);
+		}
+	}
 	while (!stack.empty()) {
 		const size_t j = stack.back();
 		stack.pop_back();
 		rank[j] = order.size();
 		order.push_back(j);
-		for (size_t k = kids[j].size(); k-- > 0;)
+		for (size_t k = kids[j].size(); k-- > 0;) {
 			stack.push_back(kids[j][k]);
+		}
 	}
-	if (order.size() != J)
+	if (order.size() != J) {
 		return "ERR: the parents do not form a forest";
+	}
 	// Joint paths: each name made a valid identifier (TfMakeValidIdentifier),
 	// unique among its siblings; the names themselves go in jointNames.
 	std::vector<std::string> path(J);
@@ -1604,8 +1777,9 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 	for (size_t j : order) {
 		std::string id = TfMakeValidIdentifier(names[j]);
 		std::string p = parents[j] < 0 ? id : path[(size_t)parents[j]] + "/" + id;
-		for (int n = 1; seen.count(p); ++n)
+		for (int n = 1; seen.count(p); ++n) {
 			p = (parents[j] < 0 ? id : path[(size_t)parents[j]] + "/" + id) + "_" + std::to_string(n);
+		}
 		seen[p] = 1;
 		path[j] = p;
 	}
@@ -1621,8 +1795,9 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 		UsdSkelRoot root = UsdSkelRoot::Define(stage, SdfPath("/Clip"));
 		stage->SetDefaultPrim(root.GetPrim());
 		VtDictionary cld;
-		for (const std::pair<std::string, std::string> &kv : meta)
+		for (const std::pair<std::string, std::string> &kv : meta) {
 			cld[kv.first] = VtValue(kv.second);
+		}
 		stage->GetRootLayer()->SetCustomLayerData(cld);
 		UsdSkelSkeleton skel = UsdSkelSkeleton::Define(stage, SdfPath("/Clip/Skeleton"));
 		VtTokenArray jt(J), jn(J);
@@ -1641,24 +1816,29 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 		UsdSkelAnimation anim = UsdSkelAnimation::Define(stage, SdfPath("/Clip/Skeleton/Motion"));
 		const size_t A = anim_joints.size();
 		VtTokenArray at(A);
-		for (size_t a = 0; a < A; ++a)
+		for (size_t a = 0; a < A; ++a) {
 			at[a] = TfToken(path[(size_t)anim_joints[a]]);
+		}
 		anim.CreateJointsAttr(VtValue(at));
 		for (size_t f = 0; f < frames; ++f) {
 			VtMatrix4dArray xf(A);
-			for (size_t a = 0; a < A; ++a)
+			for (size_t a = 0; a < A; ++a) {
 				xf[a] = matrix_from12(anim_local + (f * A + a) * 12);
-			if (!anim.SetTransforms(xf, UsdTimeCode(double(f))))
+			}
+			if (!anim.SetTransforms(xf, UsdTimeCode(double(f)))) {
 				return "ERR: SetTransforms failed at frame " + std::to_string(f) + ": " + first_error(mark);
+			}
 		}
 		UsdSkelBindingAPI::Apply(skel.GetPrim()).CreateAnimationSourceRel().SetTargets({ anim.GetPath() });
 		std::string why;
 		UsdSkelTopology topo(jt);
-		if (!topo.Validate(&why))
+		if (!topo.Validate(&why)) {
 			return "ERR: skeleton topology: " + why;
+		}
 		std::string text;
-		if (!stage->GetRootLayer()->ExportToString(&text))
+		if (!stage->GetRootLayer()->ExportToString(&text)) {
 			return "ERR: export failed: " + first_error(mark);
+		}
 		// The text must parse back before it leaves (a writer that emits a
 		// file OpenUSD cannot read is refused here, not found by cage.elf).
 		SdfLayerRefPtr check = SdfLayer::CreateAnonymous(".usda");
@@ -1693,19 +1873,27 @@ uint32_t crc32_of(const std::string &s) {
 	if (!made) {
 		for (uint32_t i = 0; i < 256; ++i) {
 			uint32_t c = i;
-			for (int k = 0; k < 8; ++k)
+			for (int k = 0; k < 8; ++k) {
 				c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+			}
 			table[i] = c;
 		}
 		made = true;
 	}
 	uint32_t c = 0xFFFFFFFFu;
-	for (unsigned char b : s)
+	for (unsigned char b : s) {
 		c = table[(c ^ b) & 0xFF] ^ (c >> 8);
+	}
 	return c ^ 0xFFFFFFFFu;
 }
-void le16(std::string &o, uint32_t v) { o.push_back(char(v & 0xFF)); o.push_back(char((v >> 8) & 0xFF)); }
-void le32(std::string &o, uint32_t v) { le16(o, v & 0xFFFF); le16(o, v >> 16); }
+void le16(std::string &o, uint32_t v) {
+	o.push_back(char(v & 0xFF));
+	o.push_back(char((v >> 8) & 0xFF));
+}
+void le32(std::string &o, uint32_t v) {
+	le16(o, v & 0xFFFF);
+	le16(o, v >> 16);
+}
 } // namespace
 
 std::string usdz_package(const std::string &member, const std::string &data) {
@@ -1714,31 +1902,57 @@ std::string usdz_package(const std::string &member, const std::string &data) {
 	size_t extra = 0;
 	if ((30 + member.size()) % 64 != 0) {
 		extra = 64 - (30 + member.size()) % 64;
-		if (extra < 4)
+		if (extra < 4) {
 			extra += 64;
+		}
 	}
 	std::string z;
 	le32(z, 0x04034b50);
-	le16(z, 20); le16(z, 0); le16(z, 0); le16(z, 0); le16(z, 0x21);
-	le32(z, crc); le32(z, size); le32(z, size);
-	le16(z, (uint32_t)member.size()); le16(z, (uint32_t)extra);
+	le16(z, 20);
+	le16(z, 0);
+	le16(z, 0);
+	le16(z, 0);
+	le16(z, 0x21);
+	le32(z, crc);
+	le32(z, size);
+	le32(z, size);
+	le16(z, (uint32_t)member.size());
+	le16(z, (uint32_t)extra);
 	z += member;
 	if (extra) {
-		le16(z, 0x1986); le16(z, (uint32_t)(extra - 4));
+		le16(z, 0x1986);
+		le16(z, (uint32_t)(extra - 4));
 		z.append(extra - 4, '\0');
 	}
 	z += data;
 	const uint32_t cd = (uint32_t)z.size();
 	le32(z, 0x02014b50);
-	le16(z, 20); le16(z, 20); le16(z, 0); le16(z, 0); le16(z, 0); le16(z, 0x21);
-	le32(z, crc); le32(z, size); le32(z, size);
-	le16(z, (uint32_t)member.size()); le16(z, 0); le16(z, 0); le16(z, 0); le16(z, 0);
-	le32(z, 0); le32(z, 0);
+	le16(z, 20);
+	le16(z, 20);
+	le16(z, 0);
+	le16(z, 0);
+	le16(z, 0);
+	le16(z, 0x21);
+	le32(z, crc);
+	le32(z, size);
+	le32(z, size);
+	le16(z, (uint32_t)member.size());
+	le16(z, 0);
+	le16(z, 0);
+	le16(z, 0);
+	le16(z, 0);
+	le32(z, 0);
+	le32(z, 0);
 	z += member;
 	const uint32_t cd_size = (uint32_t)z.size() - cd;
 	le32(z, 0x06054b50);
-	le16(z, 0); le16(z, 0); le16(z, 1); le16(z, 1);
-	le32(z, cd_size); le32(z, cd); le16(z, 0);
+	le16(z, 0);
+	le16(z, 0);
+	le16(z, 1);
+	le16(z, 1);
+	le32(z, cd_size);
+	le32(z, cd);
+	le16(z, 0);
 	return z;
 }
 
@@ -1747,32 +1961,42 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 		const std::vector<int32_t> &parents, const float *rest_local, const float *bind_world, const int32_t *skin_indices,
 		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta) {
 	const std::string init = usdmem::init();
-	if (init.compare(0, 3, "ok ") != 0)
+	if (init.compare(0, 3, "ok ") != 0) {
 		return "ERR: init: " + init;
-	if (!SdfPath::IsValidIdentifier(name))
+	}
+	if (!SdfPath::IsValidIdentifier(name)) {
 		return "ERR: '" + name + "' is not a valid prim name";
+	}
 	size_t corners = 0;
 	for (size_t f = 0; f < counts.size(); ++f) {
-		if (counts[f] < 3)
+		if (counts[f] < 3) {
 			return "ERR: face " + std::to_string(f) + " has " + std::to_string(counts[f]) + " corner(s)";
+		}
 		corners += (size_t)counts[f];
 	}
-	if (corners != indices.size())
+	if (corners != indices.size()) {
 		return "ERR: counts sum " + std::to_string(corners) + " != indices " + std::to_string(indices.size());
-	for (int32_t i : indices)
-		if (i < 0 || (size_t)i >= n_points)
+	}
+	for (int32_t i : indices) {
+		if (i < 0 || (size_t)i >= n_points) {
 			return "ERR: index " + std::to_string(i) + " out of range for " + std::to_string(n_points) + " points";
+		}
+	}
 	const size_t J = joints.size();
 	const bool skinned = J > 0;
 	if (skinned) {
-		if (parents.size() != J)
+		if (parents.size() != J) {
 			return "ERR: " + std::to_string(parents.size()) + " parents for " + std::to_string(J) + " joints";
-		for (size_t j = 0; j < J; ++j)
-			if (parents[j] >= (int32_t)j)
+		}
+		for (size_t j = 0; j < J; ++j) {
+			if (parents[j] >= (int32_t)j) {
 				return "ERR: joint " + std::to_string(j) + " has parent " + std::to_string(parents[j]) +
 						"; parents must come before children, so the skin indices keep their meaning";
-		if (element_size == 0 || !skin_indices || !skin_weights || !rest_local || !bind_world)
+			}
+		}
+		if (element_size == 0 || !skin_indices || !skin_weights || !rest_local || !bind_world) {
 			return "ERR: a skinned mesh needs element_size, skin indices, skin weights, rests and binds";
+		}
 	}
 	// Joint paths: each name made a valid identifier, unique among its siblings (as write_skel_clip does);
 	// jointNames carry the names as given. Order is kept, so skin indices need no remapping.
@@ -1782,8 +2006,9 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 		const std::string id = TfMakeValidIdentifier(joints[j]);
 		const std::string base = parents[j] < 0 ? id : path[(size_t)parents[j]] + "/" + id;
 		std::string p = base;
-		for (int n = 1; seen.count(p); ++n)
+		for (int n = 1; seen.count(p); ++n) {
 			p = base + "_" + std::to_string(n);
+		}
 		seen[p] = 1;
 		path[j] = p;
 	}
@@ -1794,8 +2019,9 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 		UsdGeomSetStageMetersPerUnit(stage, 1.0);
 		const std::string root_path = "/" + name;
 		VtDictionary cld;
-		for (const std::pair<std::string, std::string> &kv : meta)
+		for (const std::pair<std::string, std::string> &kv : meta) {
 			cld[kv.first] = VtValue(kv.second);
+		}
 		stage->GetRootLayer()->SetCustomLayerData(cld);
 		UsdGeomMesh mesh;
 		if (skinned) {
@@ -1816,8 +2042,9 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 			skel.CreateRestTransformsAttr(VtValue(rest));
 			std::string why;
 			UsdSkelTopology topo(jt);
-			if (!topo.Validate(&why))
+			if (!topo.Validate(&why)) {
 				return "ERR: skeleton topology: " + why;
+			}
 			mesh = UsdGeomMesh::Define(stage, SdfPath(root_path + "/" + name));
 			UsdSkelBindingAPI bapi = UsdSkelBindingAPI::Apply(mesh.GetPrim());
 			bapi.CreateSkeletonRel().SetTargets({ skel.GetPath() });
@@ -1825,8 +2052,9 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 			VtIntArray si(n_points * element_size);
 			VtFloatArray sw(n_points * element_size);
 			for (size_t k = 0; k < si.size(); ++k) {
-				if (skin_indices[k] < 0 || (size_t)skin_indices[k] >= J)
+				if (skin_indices[k] < 0 || (size_t)skin_indices[k] >= J) {
 					return "ERR: skin index " + std::to_string(skin_indices[k]) + " out of range for " + std::to_string(J) + " joints";
+				}
 				si[k] = skin_indices[k];
 				sw[k] = skin_weights[k];
 			}
@@ -1838,27 +2066,31 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 			mesh = UsdGeomMesh::Define(stage, SdfPath(root_path + "/" + name));
 		}
 		VtVec3fArray pts(n_points);
-		for (size_t i = 0; i < n_points; ++i)
+		for (size_t i = 0; i < n_points; ++i) {
 			pts[i] = GfVec3f(points[i * 3], points[i * 3 + 1], points[i * 3 + 2]);
+		}
 		mesh.CreatePointsAttr(VtValue(pts));
 		mesh.CreateFaceVertexCountsAttr(VtValue(VtIntArray(counts.begin(), counts.end())));
 		mesh.CreateFaceVertexIndicesAttr(VtValue(VtIntArray(indices.begin(), indices.end())));
 		mesh.CreateSubdivisionSchemeAttr(VtValue(UsdGeomTokens->none));
 		if (uvs) {
 			VtVec2fArray st(n_points);
-			for (size_t i = 0; i < n_points; ++i)
+			for (size_t i = 0; i < n_points; ++i) {
 				st[i] = GfVec2f(uvs[i * 2], uvs[i * 2 + 1]);
+			}
 			UsdGeomPrimvar pv = UsdGeomPrimvarsAPI(mesh.GetPrim())
-					.CreatePrimvar(TfToken("st"), SdfValueTypeNames->TexCoord2fArray, UsdGeomTokens->vertex);
+										.CreatePrimvar(TfToken("st"), SdfValueTypeNames->TexCoord2fArray, UsdGeomTokens->vertex);
 			pv.Set(st);
 		}
 		std::string text;
-		if (!stage->GetRootLayer()->ExportToString(&text))
+		if (!stage->GetRootLayer()->ExportToString(&text)) {
 			return "ERR: export failed: " + first_error(mark);
+		}
 		SdfLayerRefPtr check = SdfLayer::CreateAnonymous(".usda");
-		if (!check->ImportFromString(text))
+		if (!check->ImportFromString(text)) {
 			return "ERR: the exported text does not parse back (" + std::to_string(text.size()) + " bytes): " +
 					first_error(mark).substr(0, 200);
+		}
 		return usdz_package(name + ".usda", text);
 	} catch (const std::exception &e) {
 		return std::string("ERR: write exception: ") + e.what();

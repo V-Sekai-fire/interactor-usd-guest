@@ -5,11 +5,11 @@
 
 #include "usd_probe_core.h"
 
-#include "mem_resolver.h"
 #include "common/blake3.h"
+#include "mem_resolver.h"
 
-#include "pxr/pxr.h"
 #include "pxr/base/tf/errorMark.h"
+#include "pxr/pxr.h"
 #include "pxr/usd/sdf/layer.h"
 #include "pxr/usd/usd/primRange.h"
 #include "pxr/usd/usd/stage.h"
@@ -27,15 +27,15 @@ PXR_NAMESPACE_USING_DIRECTIVE
 namespace usdp {
 
 static std::string first_error(const TfErrorMark &m) {
-	for (auto it = m.GetBegin(); it != m.GetEnd(); ++it)
+	for (auto it = m.GetBegin(); it != m.GetEnd(); ++it) {
 		return it->GetCommentary();
+	}
 	return "unknown";
 }
 
 std::string init() {
 	return usdmem::init();
 }
-
 
 std::string load(const std::string &bytes, int path_mode) {
 	init();
@@ -46,8 +46,9 @@ std::string load(const std::string &bytes, int path_mode) {
 	try {
 		if (!crate && path_mode == 0) {
 			SdfLayerRefPtr layer = SdfLayer::CreateAnonymous(".usda");
-			if (!layer->ImportFromString(bytes))
+			if (!layer->ImportFromString(bytes)) {
 				return "ERR: fmt=usda ImportFromString failed: " + first_error(mark);
+			}
 			stage = UsdStage::Open(layer, UsdStage::LoadAll);
 		} else {
 			// A fresh path per load: the layer registry never hands back a
@@ -56,26 +57,31 @@ std::string load(const std::string &bytes, int path_mode) {
 			std::string path = "/mem/input" + std::to_string(++serial) + "." + fmt;
 			usdmem::put_asset(path, bytes.data(), bytes.size());
 			SdfLayerRefPtr layer = SdfLayer::FindOrOpen(path);
-			if (!layer)
+			if (!layer) {
 				return std::string("ERR: fmt=") + fmt + " open failed: " + first_error(mark);
+			}
 			stage = UsdStage::Open(layer, UsdStage::LoadAll);
 		}
 	} catch (const std::exception &e) {
 		return std::string("ERR: fmt=") + fmt + " exception: " + e.what();
 	}
-	if (!stage)
+	if (!stage) {
 		return std::string("ERR: fmt=") + fmt + " no stage: " + first_error(mark);
+	}
 
 	size_t prims = 0, meshes = 0, skels = 0, roots = 0, npts = 0, nfvi = 0;
 	blake3::Ctx h; // over each mesh's path, points and face-vertex indices, in Traverse() order
 	for (const UsdPrim &prim : stage->Traverse()) {
 		++prims;
-		if (prim.IsA<UsdSkelSkeleton>())
+		if (prim.IsA<UsdSkelSkeleton>()) {
 			++skels;
-		if (prim.IsA<UsdSkelRoot>())
+		}
+		if (prim.IsA<UsdSkelRoot>()) {
 			++roots;
-		if (!prim.IsA<UsdGeomMesh>())
+		}
+		if (!prim.IsA<UsdGeomMesh>()) {
 			continue;
+		}
 		++meshes;
 		UsdGeomMesh mesh(prim);
 		VtVec3fArray pts;
@@ -85,17 +91,20 @@ std::string load(const std::string &bytes, int path_mode) {
 		npts += pts.size();
 		nfvi += fvi.size();
 		h.update(prim.GetPath().GetString().data(), prim.GetPath().GetString().size());
-		if (!pts.empty())
+		if (!pts.empty()) {
 			h.update(pts.cdata(), pts.size() * sizeof(GfVec3f));
-		if (!fvi.empty())
+		}
+		if (!fvi.empty()) {
 			h.update(fvi.cdata(), fvi.size() * sizeof(int));
+		}
 	}
 	char buf[256];
 	std::snprintf(buf, sizeof buf, "ok fmt=%s prims=%zu meshes=%zu skels=%zu skelroots=%zu points=%zu fvi=%zu mesh_blake3=%.12s",
 			fmt, prims, meshes, skels, roots, npts, nfvi, h.hex().c_str());
 	std::string out = buf;
-	if (!mark.IsClean())
+	if (!mark.IsClean()) {
 		out += " warn=" + first_error(mark);
+	}
 	return out;
 }
 
