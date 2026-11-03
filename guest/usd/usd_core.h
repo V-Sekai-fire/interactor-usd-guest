@@ -60,6 +60,9 @@ struct MeshInfo {
 	std::vector<int32_t> surfaces;
 	// The mesh's blend shapes: records [shape_first, shape_first + shapes) of the blend-shape table.
 	int shape_first = 0, shapes = 0;
+	// The mesh's UsdGeomSubsets other than materialBind ones, one "family/name=faces" per line.
+	std::string subsets;
+	int subset_count = 0;
 };
 bool mesh_info(int i, MeshInfo &out);
 // Views into the flat tables; n is the element count (points / triangles).
@@ -149,6 +152,9 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 // is not null. Nothing is dropped or rounded. A mesh with shapes and no joints is a UsdSkelRoot (an
 // Xform otherwise), so the shapes bind.
 //
+// When face_labels is not empty (one value a face, 0 or 1) the mesh gets a GeomSubset family "rigidSoft"
+// of type partition with subsets "rigid" (label 0) and "soft" (label 1).
+//
 // Names follow the engine's rule (modules/gltf/gltf_document.cpp _gen_unique_name_static, FBX's
 // _gen_unique_name): String::validate_node_name() replaces . : @ / " % with _, then
 // String::validate_ascii_identifier() makes it a USD-valid identifier (empty -> "_", a leading digit
@@ -208,7 +214,7 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 		const std::vector<int32_t> &parents, const float *rest_local, const float *bind_world, const int32_t *skin_indices,
 		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta,
 		const std::vector<BlendShapeIn> &shapes = {}, const BlendClipIn *clip = nullptr, const MaterialIn *material = nullptr,
-		const std::map<std::string, std::string> *textures = nullptr);
+		const std::map<std::string, std::string> *textures = nullptr, const std::vector<int32_t> &face_labels = {});
 
 // UsdSkelSkeleton prims, in Traverse() order. Joint transforms are 12 floats
 // as the animation table's: bind is each joint's bindTransforms entry, rest its

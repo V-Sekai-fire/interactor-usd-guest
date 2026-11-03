@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -233,6 +234,8 @@ static Variant usd_mesh_info(int i) {
 		d["surfaces"] = Variant(PackedArray<int32_t>(m.surfaces));
 		d["shape_first"] = Variant(m.shape_first);
 		d["shapes"] = Variant(m.shapes);
+		d["subsets"] = text(m.subsets);
+		d["subset_count"] = Variant(m.subset_count);
 		return Variant(d);
 	});
 }
@@ -465,10 +468,12 @@ static Variant usd_write_curves_staged(PackedArray<float> points, PackedArray<in
 // One mesh as a .usdz package (usdg::write_mesh): the arrays the usd_mesh_* readers return, written back.
 // The host puts a call's arguments in registers a1..a7, so the call packs into four. header: line 1 is
 // the mesh name, then k=v lines; np, nuv, nrest, nf and ni (counts of points, uv floats, rest floats,
-// faces, corners) size the arrays and every other k=v goes to customLayerData. joints: one "name<TAB>parent"
+// faces, corners, nlabel = per-face rigid/soft labels) size the arrays; every other k=v
+// (author, license, license_url, ...) goes to customLayerData. joints: one "name<TAB>parent"
 // line per joint (parent -1 for a root, parents before children), empty for no skin. floats: points (3 np),
 // uvs (nuv), rests (J x 24: parent-local rest 12 then world bind 12) and skin weights (np x element_size),
-// back to back. ints: face corner counts (nf), corners (ni) and skin indices, back to back.
+// back to back. ints: face corner counts (nf), corners (ni), labels (nlabel; 0 rigid, 1 soft, one a face, written
+// as the rigidSoft GeomSubset family) and skin indices, back to back.
 // Blend shapes (optional, after those blocks): nshapes=K; per shape i shape<i>=<name> (any text, even empty or a
 // repeat: the writer makes working names, see usdg::BlendShapeIn), shape<i>_n=<listed points> and
 // shape<i>_normals=0|1; per shape i with in-betweens shape<i>_ibs=M and, for j < M, shape<i>_ib<j>=<name> and
@@ -609,7 +614,7 @@ static Variant write_mesh_call(PackedArray<float> floats, PackedArray<int32_t> i
 			g_in_i.clear();
 		}
 		std::string name;
-		size_t np = 0, nuv = 0, nrest = 0, nf = 0, ni = 0, nshapes = 0, clip_frames = 0;
+		size_t np = 0, nuv = 0, nrest = 0, nf = 0, ni = 0, nlabel = 0, nshapes = 0, clip_frames = 0;
 		double clip_fps = 0.0;
 		std::map<size_t, ShapeHdr> sh;
 		std::vector<std::pair<std::string, std::string>> m;
@@ -673,6 +678,8 @@ static Variant write_mesh_call(PackedArray<float> floats, PackedArray<int32_t> i
 				ni = v;
 			} else if (k == "input") {
 				// input=pushed, handled above
+			} else if (k == "nlabel") {
+				nlabel = v;
 			} else if (k == "nshapes") {
 				nshapes = v;
 			} else if (k == "clip_frames") {
@@ -742,16 +749,16 @@ static Variant write_mesh_call(PackedArray<float> floats, PackedArray<int32_t> i
 			}
 			shape_floats += clip_frames * nshapes;
 		}
-		if (f.size() < np * 3 + nuv + nrest + shape_floats || n.size() < nf + ni + shape_ints) {
+		if (f.size() < np * 3 + nuv + nrest + shape_floats || n.size() < nf + ni + nlabel + shape_ints) {
 			return fail("usd_write_mesh: the arrays are shorter than the header sizes");
 		}
-		const size_t nw = f.size() - np * 3 - nuv - nrest - shape_floats, nsi = n.size() - nf - ni - shape_ints;
+		const size_t nw = f.size() - np * 3 - nuv - nrest - shape_floats, nsi = n.size() - nf - ni - nlabel - shape_ints;
 		const float *pts = f.data(), *uv = pts + np * 3, *rests = uv + nuv, *w = rests + nrest;
 		std::vector<usdg::BlendShapeIn> shapes;
 		usdg::BlendClipIn clip;
 		{
 			const float *sf = w + nw;
-			const int32_t *sidx = n.data() + nf + ni + nsi;
+			const int32_t *sidx = n.data() + nf + ni + nlabel + nsi;
 			for (size_t i = 0; i < nshapes; ++i) {
 				const ShapeHdr &h = sh[i];
 				usdg::BlendShapeIn b;
@@ -814,13 +821,14 @@ static Variant write_mesh_call(PackedArray<float> floats, PackedArray<int32_t> i
 				bind.insert(bind.end(), rests + k * 24 + 12, rests + k * 24 + 24);
 			}
 		}
-		const std::vector<int32_t> c(n.begin(), n.begin() + nf), ix(n.begin() + nf, n.begin() + nf + ni);
+		const std::vector<int32_t> c(n.begin(), n.begin() + nf), ix(n.begin() + nf, n.begin() + nf + ni),
+				labels(n.begin() + nf + ni, n.begin() + nf + ni + nlabel);
 		if (saw_mat_key && !has_material) {
 			return fail("usd_write_mesh: mat_ keys without material=<name>");
 		}
 		std::string z = usdg::write_mesh(name, pts, np, c, ix, nuv ? uv : nullptr, j, pa, rest.data(), bind.data(),
-				n.data() + nf + ni, w, element_size, m, shapes, clip.frames ? &clip : nullptr, has_material ? &material : nullptr,
-				&g_textures);
+				n.data() + nf + ni + nlabel, w, element_size, m, shapes, clip.frames ? &clip : nullptr,
+				has_material ? &material : nullptr, &g_textures, labels);
 		// The handed-over textures belong to this write, whether it succeeded or not.
 		std::map<std::string, std::string>().swap(g_textures);
 		if (z.compare(0, 5, "ERR: ") == 0) {
