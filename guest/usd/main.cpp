@@ -477,6 +477,12 @@ static Variant usd_write_curves_staged(PackedArray<float> points, PackedArray<in
 // (0, 1)), n x 3 offsets, n x 3 normal offsets when flagged; last F x K clip weights (row per frame, shape
 // order, targets only). ints hold, per shape, its n strictly increasing point indices (an in-between uses its
 // target's). Keys of the form shape<digits>... listed above are never customLayerData.
+// A material (optional): material=<prim name> adds /<name>/Looks/<prim name>, a UsdPreviewSurface bound to the mesh
+// (usdg::MaterialIn). mat_diffuse=r,g,b, mat_metallic, mat_roughness and mat_opacity are the constants (defaults
+// 1,1,1 / 0 / 0.5 / 1); mat_diffuse_tex, mat_normal_tex, mat_metallic_tex, mat_roughness_tex and mat_opacity_tex name
+// a texture instead, by the member name it was handed over under with usd_write_texture ("textures/Blue_A.png"); the
+// package stores those files beside the layer, so it is one file. mat_double_sided=0|1. A texture needs nuv = 2 np.
+// The mat_ keys are never customLayerData, and an unknown mat_ key or one without material= is an error.
 struct ShapeHdr {
 	struct Ib {
 		std::string name;
@@ -568,6 +574,29 @@ static Variant usd_write_input_clear() {
 	return text("ok");
 }
 
+// Texture files for the next usd_write_mesh whose header names a material, by the member name the material's *_tex
+// keys use ("textures/Blue_A.png"). Each call appends to that member, so a file past the host's 16 MiB call limit can
+// arrive in pieces. A write takes them, like the pushed input arrays: the next write starts with none.
+static std::map<std::string, std::string> g_textures;
+
+static Variant usd_write_texture(String name, PackedArray<uint8_t> bytes) {
+	return guarded("usd_write_texture", [&] {
+		const std::string n = name.utf8();
+		if (n.empty()) {
+			return fail("usd_write_texture: the member name is empty");
+		}
+		const std::vector<uint8_t> b = bytes.fetch();
+		std::string &t = g_textures[n];
+		t.append((const char *)b.data(), b.size());
+		return Variant((int64_t)t.size());
+	});
+}
+
+static Variant usd_write_texture_clear() {
+	std::map<std::string, std::string>().swap(g_textures);
+	return text("ok");
+}
+
 static Variant write_mesh_call(PackedArray<float> floats, PackedArray<int32_t> ints, String header, String joints, bool staged) {
 	return guarded("usd_write_mesh", [&] {
 		// Header "input=pushed": the arrays are the ones pushed with usd_write_input_floats / usd_write_input_ints (a
@@ -584,6 +613,8 @@ static Variant write_mesh_call(PackedArray<float> floats, PackedArray<int32_t> i
 		double clip_fps = 0.0;
 		std::map<size_t, ShapeHdr> sh;
 		std::vector<std::pair<std::string, std::string>> m;
+		usdg::MaterialIn material;
+		bool has_material = false, saw_mat_key = false;
 		for (const std::string &ln : lines_of(header.utf8())) {
 			if (name.empty()) {
 				name = ln;
@@ -597,7 +628,40 @@ static Variant write_mesh_call(PackedArray<float> floats, PackedArray<int32_t> i
 			const size_t v = (size_t)std::atoll(ln.c_str() + eq + 1);
 			size_t si = 0, sj = 0;
 			int kind = 0;
-			if (k == "np") {
+			if (k == "material") {
+				material.name = ln.substr(eq + 1);
+				has_material = true;
+			} else if (k.compare(0, 4, "mat_") == 0) {
+				// The material's values are text (a colour, a member name), so they are read from the line, not as the
+				// count v above.
+				saw_mat_key = true;
+				const std::string val = ln.substr(eq + 1);
+				if (k == "mat_diffuse") {
+					if (std::sscanf(val.c_str(), "%f,%f,%f", &material.diffuse[0], &material.diffuse[1], &material.diffuse[2]) != 3) {
+						return fail("usd_write_mesh: mat_diffuse '" + val + "' is not r,g,b");
+					}
+				} else if (k == "mat_metallic") {
+					material.metallic = (float)std::atof(val.c_str());
+				} else if (k == "mat_roughness") {
+					material.roughness = (float)std::atof(val.c_str());
+				} else if (k == "mat_opacity") {
+					material.opacity = (float)std::atof(val.c_str());
+				} else if (k == "mat_double_sided") {
+					material.double_sided = val != "0";
+				} else if (k == "mat_diffuse_tex") {
+					material.diffuse_tex = val;
+				} else if (k == "mat_normal_tex") {
+					material.normal_tex = val;
+				} else if (k == "mat_metallic_tex") {
+					material.metallic_tex = val;
+				} else if (k == "mat_roughness_tex") {
+					material.roughness_tex = val;
+				} else if (k == "mat_opacity_tex") {
+					material.opacity_tex = val;
+				} else {
+					return fail("usd_write_mesh: unknown material key '" + k + "'");
+				}
+			} else if (k == "np") {
 				np = v;
 			} else if (k == "nuv") {
 				nuv = v;
@@ -751,8 +815,14 @@ static Variant write_mesh_call(PackedArray<float> floats, PackedArray<int32_t> i
 			}
 		}
 		const std::vector<int32_t> c(n.begin(), n.begin() + nf), ix(n.begin() + nf, n.begin() + nf + ni);
+		if (saw_mat_key && !has_material) {
+			return fail("usd_write_mesh: mat_ keys without material=<name>");
+		}
 		std::string z = usdg::write_mesh(name, pts, np, c, ix, nuv ? uv : nullptr, j, pa, rest.data(), bind.data(),
-				n.data() + nf + ni, w, element_size, m, shapes, clip.frames ? &clip : nullptr);
+				n.data() + nf + ni, w, element_size, m, shapes, clip.frames ? &clip : nullptr, has_material ? &material : nullptr,
+				&g_textures);
+		// The handed-over textures belong to this write, whether it succeeded or not.
+		std::map<std::string, std::string>().swap(g_textures);
 		if (z.compare(0, 5, "ERR: ") == 0) {
 			return text(z);
 		}
@@ -1207,7 +1277,7 @@ int main() {
 			"A .usda of linear BasisCurves under /Creation (names and k=v meta one per line), or ERR:");
 	ADD_API_FUNCTION(usd_write_mesh, "PackedByteArray",
 			"PackedFloat32Array floats, PackedInt32Array ints, String header, String joints",
-			"A .usdz package of one mesh with its uvs, skin, optional sparse blend shapes and weight clip (header keys nshapes, shape<i>, shape<i>_n, shape<i>_normals, clip_frames, clip_fps; four packed arguments: the host has seven registers), or an ERR: String. A package past the host's 16 MiB view is staged instead: the answer is a String that starts with STAGED and usd_written_slice reads it");
+			"A .usdz package of one mesh with its uvs, skin, optional sparse blend shapes and weight clip, and an optional UsdPreviewSurface material (header keys material, mat_diffuse, mat_metallic, mat_roughness, mat_opacity, mat_double_sided, mat_diffuse_tex, mat_normal_tex, mat_metallic_tex, mat_roughness_tex, mat_opacity_tex; the textures come first through usd_write_texture and are stored in the package) (header keys nshapes, shape<i>, shape<i>_n, shape<i>_normals, clip_frames, clip_fps; four packed arguments: the host has seven registers), or an ERR: String. A package past the host's 16 MiB view is staged instead: the answer is a String that starts with STAGED and usd_written_slice reads it");
 	ADD_API_FUNCTION(usd_write_skel_clip, "String",
 			"String names, PackedInt32Array parents, PackedFloat32Array rests, PackedInt32Array anim_joints, PackedFloat32Array anim_local, float fps, String meta",
 			"A .usda of one UsdSkel motion clip (RFD 2277 A2), optionally with blend-shape weights in the same SkelAnimation (meta nshapes, shape<i>, clip_frames; weights after the transform floats), or ERR:");
@@ -1223,6 +1293,9 @@ int main() {
 	ADD_API_FUNCTION(usd_write_input_floats, "Variant", "PackedFloat32Array chunk", "Append a piece to the float input of the next usd_write_mesh / usd_write_mesh_staged whose header has input=pushed; answers the floats held so far");
 	ADD_API_FUNCTION(usd_write_input_ints, "Variant", "PackedInt32Array chunk", "Append a piece to the int input of the next write with input=pushed; answers the ints held so far");
 	ADD_API_FUNCTION(usd_write_input_clear, "String", "", "Drop the pushed write input");
+	ADD_API_FUNCTION(usd_write_texture, "Variant", "String name, PackedByteArray bytes",
+			"Append bytes to the texture file the next usd_write_mesh stores under this package member name (\"textures/Blue_A.png\", the name its mat_*_tex keys use); answers the bytes held for it. A write takes the textures.");
+	ADD_API_FUNCTION(usd_write_texture_clear, "String", "", "Drop the handed-over textures");
 	ADD_API_FUNCTION(usd_written_size, "int", "", "Bytes of the staged write result, 0 when none");
 	ADD_API_FUNCTION(usd_written_slice, "Variant", "int from, int count", "Bytes [from, from+count) of the staged write result (count capped at 8 MiB), or a FAIL: String when nothing is staged, count is not positive or from is outside the result");
 	ADD_API_FUNCTION(usd_written_release, "String", "", "Free the staged write result");

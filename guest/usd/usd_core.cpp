@@ -46,6 +46,7 @@
 #include "pxr/usd/usd/stage.h"
 #include "pxr/usd/usdGeom/basisCurves.h"
 #include "pxr/usd/usdGeom/mesh.h"
+#include "pxr/usd/usdGeom/scope.h"
 #include "pxr/usd/usdGeom/metrics.h"
 #include "pxr/usd/usdGeom/primvarsAPI.h"
 #include "pxr/usd/usdGeom/subset.h"
@@ -2075,6 +2076,80 @@ std::string usdz_package(const std::string &member, const std::string &data) {
 	return z;
 }
 
+// The same package with several members: the layer first (a .usdz's first member is its root layer), then the
+// textures. Each member's data starts on a 64-byte boundary of the file (the extra field pads it), so the host can map it.
+static std::string usdz_package_members(const std::vector<std::pair<std::string, std::string>> &members) {
+	struct Entry {
+		uint32_t crc, size, offset;
+	};
+	std::vector<Entry> entries;
+	std::string z;
+	for (const std::pair<std::string, std::string> &m : members) {
+		const std::string &member = m.first;
+		const std::string &data = m.second;
+		const uint32_t crc = crc32_of(data), size = (uint32_t)data.size(), offset = (uint32_t)z.size();
+		size_t extra = 0;
+		const size_t data_at = z.size() + 30 + member.size();
+		if (data_at % 64 != 0) {
+			extra = 64 - data_at % 64;
+			if (extra < 4) {
+				extra += 64;
+			}
+		}
+		le32(z, 0x04034b50);
+		le16(z, 20);
+		le16(z, 0);
+		le16(z, 0);
+		le16(z, 0);
+		le16(z, 0x21);
+		le32(z, crc);
+		le32(z, size);
+		le32(z, size);
+		le16(z, (uint32_t)member.size());
+		le16(z, (uint32_t)extra);
+		z += member;
+		if (extra) {
+			le16(z, 0x1986);
+			le16(z, (uint32_t)(extra - 4));
+			z.append(extra - 4, '\0');
+		}
+		z += data;
+		entries.push_back({ crc, size, offset });
+	}
+	const uint32_t cd = (uint32_t)z.size();
+	for (size_t i = 0; i < members.size(); ++i) {
+		const std::string &member = members[i].first;
+		le32(z, 0x02014b50);
+		le16(z, 20);
+		le16(z, 20);
+		le16(z, 0);
+		le16(z, 0);
+		le16(z, 0);
+		le16(z, 0x21);
+		le32(z, entries[i].crc);
+		le32(z, entries[i].size);
+		le32(z, entries[i].size);
+		le16(z, (uint32_t)member.size());
+		le16(z, 0);
+		le16(z, 0);
+		le16(z, 0);
+		le16(z, 0);
+		le32(z, 0);
+		le32(z, entries[i].offset);
+		z += member;
+	}
+	const uint32_t cd_size = (uint32_t)z.size() - cd;
+	le32(z, 0x06054b50);
+	le16(z, 0);
+	le16(z, 0);
+	le16(z, (uint32_t)members.size());
+	le16(z, (uint32_t)members.size());
+	le32(z, cd_size);
+	le32(z, cd);
+	le16(z, 0);
+	return z;
+}
+
 // The most floats one array of a written layer may have (measured: 1.8 million parse back in a 1024 MB sandbox, 2.4
 // million do not).
 static constexpr size_t kMaxArrayFloats = 2000000;
@@ -2083,7 +2158,8 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 		const std::vector<int32_t> &indices, const float *uvs, const std::vector<std::string> &joints,
 		const std::vector<int32_t> &parents, const float *rest_local, const float *bind_world, const int32_t *skin_indices,
 		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta,
-		const std::vector<BlendShapeIn> &shapes, const BlendClipIn *clip) {
+		const std::vector<BlendShapeIn> &shapes, const BlendClipIn *clip, const MaterialIn *material,
+		const std::map<std::string, std::string> *textures) {
 	const std::string init = usdmem::init();
 	if (init.compare(0, 3, "ok ") != 0) {
 		return "ERR: init: " + init;
@@ -2190,6 +2266,39 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 		seen[p] = 1;
 		path[j] = p;
 	}
+	// The material's textures, checked before anything is authored (like the shapes above): each must be a plain
+	// relative member name (it becomes a zip member and an asset path, so no absolute path, no "..", no backslash),
+	// the mesh needs uvs to sample it, and its bytes must have been handed over. tex_members keeps each distinct name
+	// once, in first-use order, which is the order the package stores them.
+	std::vector<std::string> tex_members;
+	if (material) {
+		if (!SdfPath::IsValidIdentifier(material->name)) {
+			return "ERR: '" + material->name + "' is not a valid material name";
+		}
+		const std::string *want[5] = { &material->diffuse_tex, &material->normal_tex, &material->metallic_tex,
+			&material->roughness_tex, &material->opacity_tex };
+		for (const std::string *t : want) {
+			if (t->empty()) {
+				continue;
+			}
+			if (!uvs) {
+				return "ERR: material texture '" + *t + "' needs uvs (nuv = 2 x points)";
+			}
+			if ((*t)[0] == '/' || t->find("..") != std::string::npos || t->find('\\') != std::string::npos) {
+				return "ERR: material texture '" + *t + "' is not a plain relative member name";
+			}
+			if (!textures || !textures->count(*t)) {
+				return "ERR: material texture '" + *t + "' was not handed over (usd_write_texture first)";
+			}
+			bool have = false;
+			for (const std::string &x : tex_members) {
+				have = have || x == *t;
+			}
+			if (!have) {
+				tex_members.push_back(*t);
+			}
+		}
+	}
 	TfErrorMark mark;
 	try {
 		UsdStageRefPtr stage = UsdStage::CreateInMemory();
@@ -2267,6 +2376,83 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 			UsdGeomPrimvar pv = UsdGeomPrimvarsAPI(mesh.GetPrim())
 										.CreatePrimvar(TfToken("st"), SdfValueTypeNames->TexCoord2fArray, UsdGeomTokens->vertex);
 			pv.Set(st);
+		}
+		if (material) {
+			// /<name>/Looks/<material>: a UsdPreviewSurface fed by UsdUVTexture shaders that read the mesh's "st"; the
+			// texture files are package members (asset paths relative to the layer), bound to the mesh.
+			const std::string looks = root_path + "/Looks";
+			UsdGeomScope::Define(stage, SdfPath(looks));
+			const SdfPath mp(looks + "/" + material->name);
+			UsdShadeMaterial mat = UsdShadeMaterial::Define(stage, mp);
+			UsdShadeShader surf = UsdShadeShader::Define(stage, mp.AppendChild(TfToken("Surface")));
+			surf.CreateIdAttr(VtValue(TfToken("UsdPreviewSurface")));
+			UsdShadeOutput st_out;
+			if (!tex_members.empty()) {
+				UsdShadeShader reader = UsdShadeShader::Define(stage, mp.AppendChild(TfToken("StReader")));
+				reader.CreateIdAttr(VtValue(TfToken("UsdPrimvarReader_float2")));
+				reader.CreateInput(TfToken("varname"), SdfValueTypeNames->Token).Set(TfToken("st"));
+				st_out = reader.CreateOutput(TfToken("result"), SdfValueTypeNames->Float2);
+			}
+			// One UsdUVTexture shader per slot (DiffuseTexture, NormalTexture, ...), all reading the same "st". Colour data
+			// (the diffuse map) is sRGB; everything else is data and is read raw, as the UsdPreviewSurface spec asks.
+			std::map<std::string, UsdShadeShader> made;
+			auto texture = [&](const std::string &prim, const std::string &member, bool srgb, bool normal) {
+				const std::string key = prim;
+				auto it = made.find(key);
+				if (it != made.end()) {
+					return it->second;
+				}
+				UsdShadeShader t = UsdShadeShader::Define(stage, mp.AppendChild(TfToken(prim)));
+				t.CreateIdAttr(VtValue(TfToken("UsdUVTexture")));
+				t.CreateInput(TfToken("file"), SdfValueTypeNames->Asset).Set(SdfAssetPath(member));
+				t.CreateInput(TfToken("st"), SdfValueTypeNames->Float2).ConnectToSource(st_out);
+				t.CreateInput(TfToken("wrapS"), SdfValueTypeNames->Token).Set(TfToken("repeat"));
+				t.CreateInput(TfToken("wrapT"), SdfValueTypeNames->Token).Set(TfToken("repeat"));
+				t.CreateInput(TfToken("sourceColorSpace"), SdfValueTypeNames->Token).Set(TfToken(srgb ? "sRGB" : "raw"));
+				if (normal) {
+					// A tangent-space normal map stores a unit vector as 0..1 colour; scale 2 and bias -1 bring it back to
+					// -1..1 (the UsdPreviewSurface convention for the normal input).
+					t.CreateInput(TfToken("scale"), SdfValueTypeNames->Float4).Set(GfVec4f(2.0f, 2.0f, 2.0f, 1.0f));
+					t.CreateInput(TfToken("bias"), SdfValueTypeNames->Float4).Set(GfVec4f(-1.0f, -1.0f, -1.0f, 0.0f));
+				}
+				made.emplace(key, t);
+				return t;
+			};
+			if (!material->diffuse_tex.empty()) {
+				UsdShadeShader t = texture("DiffuseTexture", material->diffuse_tex, true, false);
+				surf.CreateInput(TfToken("diffuseColor"), SdfValueTypeNames->Color3f)
+						.ConnectToSource(t.CreateOutput(TfToken("rgb"), SdfValueTypeNames->Float3));
+			} else {
+				surf.CreateInput(TfToken("diffuseColor"), SdfValueTypeNames->Color3f)
+						.Set(GfVec3f(material->diffuse[0], material->diffuse[1], material->diffuse[2]));
+			}
+			if (!material->normal_tex.empty()) {
+				UsdShadeShader t = texture("NormalTexture", material->normal_tex, false, true);
+				surf.CreateInput(TfToken("normal"), SdfValueTypeNames->Normal3f)
+						.ConnectToSource(t.CreateOutput(TfToken("rgb"), SdfValueTypeNames->Float3));
+			}
+			// A one-channel input (metallic, roughness, opacity) takes the texture's red channel when a map is named and the
+			// constant otherwise; UsdPreviewSurface's scalar inputs are single floats, so a mask is read as its red channel.
+			auto scalar = [&](const char *input, const std::string &tex_member, const char *prim, float value) {
+				if (!tex_member.empty()) {
+					UsdShadeShader t = texture(prim, tex_member, false, false);
+					surf.CreateInput(TfToken(input), SdfValueTypeNames->Float)
+							.ConnectToSource(t.CreateOutput(TfToken("r"), SdfValueTypeNames->Float));
+				} else {
+					surf.CreateInput(TfToken(input), SdfValueTypeNames->Float).Set(value);
+				}
+			};
+			scalar("metallic", material->metallic_tex, "MetallicTexture", material->metallic);
+			scalar("roughness", material->roughness_tex, "RoughnessTexture", material->roughness);
+			scalar("opacity", material->opacity_tex, "OpacityTexture", material->opacity);
+			// The metallic workflow, as the metallic and roughness inputs above assume (not a specular colour).
+			surf.CreateInput(TfToken("useSpecularWorkflow"), SdfValueTypeNames->Int).Set(0);
+			surf.CreateOutput(TfToken("surface"), SdfValueTypeNames->Token);
+			mat.CreateSurfaceOutput().ConnectToSource(surf.ConnectableAPI(), TfToken("surface"));
+			UsdShadeMaterialBindingAPI::Apply(mesh.GetPrim()).Bind(mat);
+			if (material->double_sided) {
+				mesh.CreateDoubleSidedAttr(VtValue(true));
+			}
 		}
 		if (!shapes.empty()) {
 			// The working names (engine rule, see working_names) are the prim names and the skel:blendShapes
@@ -2361,7 +2547,18 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 			return "ERR: the exported text does not parse back (" + std::to_string(text.size()) + " bytes): " +
 					first_error(mark).substr(0, 200);
 		}
-		return usdz_package(name + ".usda", text);
+		// With no textures the package is the one-member form it always was, byte for byte. With textures the layer stays
+		// the first member (a .usdz's root layer) and each texture follows under its authored name, so the layer's asset
+		// paths resolve inside the package.
+		if (tex_members.empty()) {
+			return usdz_package(name + ".usda", text);
+		}
+		std::vector<std::pair<std::string, std::string>> members;
+		members.emplace_back(name + ".usda", text);
+		for (const std::string &t : tex_members) {
+			members.emplace_back(t, textures->at(t));
+		}
+		return usdz_package_members(members);
 	} catch (const std::exception &e) {
 		return std::string("ERR: write exception: ") + e.what();
 	}
