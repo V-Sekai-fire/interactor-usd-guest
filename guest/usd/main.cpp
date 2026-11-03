@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -232,6 +233,8 @@ static Variant usd_mesh_info(int i) {
 		d["surfaces"] = Variant(PackedArray<int32_t>(m.surfaces));
 		d["shape_first"] = Variant(m.shape_first);
 		d["shapes"] = Variant(m.shapes);
+		d["subsets"] = text(m.subsets);
+		d["subset_count"] = Variant(m.subset_count);
 		return Variant(d);
 	});
 }
@@ -428,16 +431,21 @@ static Variant usd_write_curves(PackedArray<float> points, PackedArray<int32_t> 
 // One mesh as a .usdz package (usdg::write_mesh): the arrays the usd_mesh_* readers return, written back.
 // The host puts a call's arguments in registers a1..a7, so the call packs into four. header: line 1 is
 // the mesh name, then k=v lines; np, nuv, nrest, nf and ni (counts of points, uv floats, rest floats,
-// faces, corners) size the arrays and every other k=v goes to customLayerData. joints: one "name<TAB>parent"
+// faces, corners, nlabel = per-face rigid/soft labels) size the arrays; material (a name) with optional
+// base_color=r,g,b roughness metallic opacity (0..1) writes a UsdPreviewSurface material; every other k=v
+// (author, license, license_url, ...) goes to customLayerData. joints: one "name<TAB>parent"
 // line per joint (parent -1 for a root, parents before children), empty for no skin. floats: points (3 np),
 // uvs (nuv), rests (J x 24: parent-local rest 12 then world bind 12) and skin weights (np x element_size),
-// back to back. ints: face corner counts (nf), corners (ni) and skin indices, back to back.
+// back to back. ints: face corner counts (nf), corners (ni), labels (nlabel; 0 rigid, 1 soft, one a face,
+// written as the rigidSoft GeomSubset family) and skin indices, back to back.
 static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> ints, String header, String joints) {
 	return guarded("usd_write_mesh", [&] {
 		const std::vector<float> f = floats.fetch();
 		const std::vector<int32_t> n = ints.fetch();
 		std::string name;
-		size_t np = 0, nuv = 0, nrest = 0, nf = 0, ni = 0;
+		size_t np = 0, nuv = 0, nrest = 0, nf = 0, ni = 0, nlabel = 0;
+		usdg::MeshMaterial mat;
+		bool has_param = false;
 		std::vector<std::pair<std::string, std::string>> m;
 		for (const std::string &ln : lines_of(header.utf8())) {
 			if (name.empty()) {
@@ -460,14 +468,40 @@ static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> in
 				nf = v;
 			} else if (k == "ni") {
 				ni = v;
+			} else if (k == "nlabel") {
+				nlabel = v;
+			} else if (k == "material") {
+				mat.name = ln.substr(eq + 1);
+			} else if (k == "base_color") {
+				if (std::sscanf(ln.c_str() + eq + 1, "%f,%f,%f", &mat.base_color[0], &mat.base_color[1], &mat.base_color[2]) != 3) {
+					return fail("usd_write_mesh: base_color '" + ln.substr(eq + 1) + "' is not r,g,b");
+				}
+				has_param = true;
+			} else if (k == "roughness" || k == "metallic" || k == "opacity") {
+				char *end = nullptr;
+				const float x = std::strtof(ln.c_str() + eq + 1, &end);
+				if (end == ln.c_str() + eq + 1) {
+					return fail("usd_write_mesh: " + k + " '" + ln.substr(eq + 1) + "' is not a number");
+				}
+				(k == "roughness" ? mat.roughness : k == "metallic" ? mat.metallic
+																	: mat.opacity) = x;
+				has_param = true;
 			} else {
 				m.emplace_back(k, ln.substr(eq + 1));
 			}
 		}
-		if (f.size() < np * 3 + nuv + nrest || n.size() < nf + ni) {
+		if (has_param && mat.name.empty()) {
+			return fail("usd_write_mesh: base_color, roughness, metallic or opacity without a material key");
+		}
+		for (float x : { mat.base_color[0], mat.base_color[1], mat.base_color[2], mat.roughness, mat.metallic, mat.opacity }) {
+			if (!(x >= 0.0f && x <= 1.0f)) {
+				return fail("usd_write_mesh: material values must be in 0..1");
+			}
+		}
+		if (f.size() < np * 3 + nuv + nrest || n.size() < nf + ni + nlabel) {
 			return fail("usd_write_mesh: the arrays are shorter than the header sizes");
 		}
-		const size_t nw = f.size() - np * 3 - nuv - nrest, nsi = n.size() - nf - ni;
+		const size_t nw = f.size() - np * 3 - nuv - nrest, nsi = n.size() - nf - ni - nlabel;
 		const float *pts = f.data(), *uv = pts + np * 3, *rests = uv + nuv, *w = rests + nrest;
 		std::vector<std::string> j;
 		std::vector<int32_t> pa;
@@ -497,9 +531,10 @@ static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> in
 				bind.insert(bind.end(), rests + k * 24 + 12, rests + k * 24 + 24);
 			}
 		}
-		const std::vector<int32_t> c(n.begin(), n.begin() + nf), ix(n.begin() + nf, n.begin() + nf + ni);
+		const std::vector<int32_t> c(n.begin(), n.begin() + nf), ix(n.begin() + nf, n.begin() + nf + ni),
+				labels(n.begin() + nf + ni, n.begin() + nf + ni + nlabel);
 		const std::string z = usdg::write_mesh(name, pts, np, c, ix, nuv ? uv : nullptr, j, pa, rest.data(), bind.data(),
-				n.data() + nf + ni, w, element_size, m);
+				n.data() + nf + ni + nlabel, w, element_size, m, mat, labels);
 		if (z.compare(0, 5, "ERR: ") == 0) {
 			return text(z);
 		}

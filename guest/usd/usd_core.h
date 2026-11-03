@@ -59,6 +59,9 @@ struct MeshInfo {
 	std::vector<int32_t> surfaces;
 	// The mesh's blend shapes: records [shape_first, shape_first + shapes) of the blend-shape table.
 	int shape_first = 0, shapes = 0;
+	// The mesh's UsdGeomSubsets other than materialBind ones, one "family/name=faces" per line.
+	std::string subsets;
+	int subset_count = 0;
 };
 bool mesh_info(int i, MeshInfo &out);
 // Views into the flat tables; n is the element count (points / triangles).
@@ -124,6 +127,13 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 		const float *anim_local, size_t frames, double fps,
 		const std::vector<std::pair<std::string, std::string>> &meta);
 
+// A UsdPreviewSurface material for write_mesh. `name` empty means no material.
+struct MeshMaterial {
+	std::string name;
+	float base_color[3] = { 0.8f, 0.8f, 0.8f };
+	float roughness = 0.5f, metallic = 0.0f, opacity = 1.0f;
+};
+
 // One mesh as a .usdz package (a zip of one .usda member, stored and 64-byte aligned: the host
 // has no streaming, so a mesh crosses as one package, as usd_open takes it). The layer is the
 // writing half of mesh_points / mesh_indices / mesh_uvs /
@@ -134,11 +144,15 @@ std::string write_skel_clip(const std::vector<std::string> &names, const std::ve
 // rest as J x 12) and the mesh's skel binding with skin_indices / skin_weights (n_points x
 // element_size). Parents must come before their children, so joint order, and with it every
 // skin index, is kept. `meta` goes in customLayerData. The text is parsed back before it is
-// returned. Returns the .usdz bytes (they begin "PK"), or text beginning "ERR: <reason>".
+// returned. When material.name is set, /<name>/Looks/<material> is a UsdShadeMaterial with a
+// UsdPreviewSurface (diffuseColor, roughness, metallic, opacity) bound to the mesh. When
+// face_labels is not empty (one value a face, 0 or 1) the mesh gets a GeomSubset family "rigidSoft"
+// of type partition with subsets "rigid" (label 0) and "soft" (label 1). Returns the .usdz bytes (they begin "PK"), or text beginning "ERR: <reason>".
 std::string write_mesh(const std::string &name, const float *points, size_t n_points, const std::vector<int32_t> &counts,
 		const std::vector<int32_t> &indices, const float *uvs, const std::vector<std::string> &joints,
 		const std::vector<int32_t> &parents, const float *rest_local, const float *bind_world, const int32_t *skin_indices,
-		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta);
+		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta,
+		const MeshMaterial &material, const std::vector<int32_t> &face_labels);
 
 // UsdSkelSkeleton prims, in Traverse() order. Joint transforms are 12 floats
 // as the animation table's: bind is each joint's bindTransforms entry, rest its

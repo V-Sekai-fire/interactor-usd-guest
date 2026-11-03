@@ -26,3 +26,7 @@ A relative reference such as `../textures/x.png` in `layers/Materials.usda` reso
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
+
+## Materials, subsets and licence in written meshes
+
+`usd_write_mesh` header keys: `material` (a prim name) with optional `base_color=r,g,b`, `roughness`, `metallic`, `opacity` (all 0..1) write `/<name>/Looks/<material>`, a UsdPreviewSurface bound to the mesh; the parameters without `material` are refused. `nlabel=<faces>` adds one int per face (0 rigid, 1 soft) after the corner indices and writes the GeomSubset family `rigidSoft` (partition) with subsets `rigid` and `soft`. Every other `k=v` (author, license, license_url, author_url) goes to customLayerData, and author, license and their URLs also to the layer documentation. `usd_mesh_info` reports `subsets` and `subset_count`. `tests/materials_subsets/` holds the finch check (`prep.py`, `write_pieces.gd`, `verify.py`, which also runs the controls).
