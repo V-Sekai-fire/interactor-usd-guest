@@ -2075,6 +2075,10 @@ std::string usdz_package(const std::string &member, const std::string &data) {
 	return z;
 }
 
+// The most floats one array of a written layer may have (measured: 1.8 million parse back in a 1024 MB sandbox, 2.4
+// million do not).
+static constexpr size_t kMaxArrayFloats = 2000000;
+
 std::string write_mesh(const std::string &name, const float *points, size_t n_points, const std::vector<int32_t> &counts,
 		const std::vector<int32_t> &indices, const float *uvs, const std::vector<std::string> &joints,
 		const std::vector<int32_t> &parents, const float *rest_local, const float *bind_world, const int32_t *skin_indices,
@@ -2087,11 +2091,26 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 	if (!SdfPath::IsValidIdentifier(name)) {
 		return "ERR: '" + name + "' is not a valid prim name";
 	}
+	// The layer is parsed back as text; the parser holds tens of bytes a number while it reads one array, so one
+	// array of millions of floats runs the sandbox (memory_max 1024) out of memory and ends the call. Refuse it
+	// here with a message. Many arrays of this size or less are fine (the total is only bounded by the sandbox).
+	if (indices.size() > kMaxArrayFloats) {
+		return "ERR: " + std::to_string(indices.size()) + " corner indices is one array past the " + std::to_string(kMaxArrayFloats) +
+				" entries the text form can be parsed back with";
+	}
+	if (n_points * 3 > kMaxArrayFloats) {
+		return "ERR: " + std::to_string(n_points) + " points is one array of " + std::to_string(n_points * 3) +
+				" floats, past the " + std::to_string(kMaxArrayFloats) + " the text form can be parsed back with";
+	}
 	// Blend shapes and the clip: checked before anything is authored.
 	for (size_t s = 0; s < shapes.size(); ++s) {
 		const BlendShapeIn &b = shapes[s];
 		const std::string what = "blend shape " + std::to_string(s) + " '" + b.name + "'";
 		// Any name is allowed, the empty one and repeats included: the working names are made unique.
+		if (b.n * 3 > kMaxArrayFloats) {
+			return "ERR: " + what + " lists " + std::to_string(b.n) + " points, one array of " + std::to_string(b.n * 3) +
+					" floats, past the " + std::to_string(kMaxArrayFloats) + " the text form can be parsed back with";
+		}
 		if (b.n == 0) {
 			return "ERR: " + what + " lists no points (list at least one, a zero offset is fine)";
 		}
