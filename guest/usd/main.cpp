@@ -404,8 +404,30 @@ static std::vector<std::string> lines_of(const std::string &s) {
 	return out;
 }
 
-static Variant usd_write_curves(PackedArray<float> points, PackedArray<int32_t> counts, PackedArray<int32_t> boundary,
-		String names, String meta) {
+// A finished write result that does not fit the host's 16 MiB view stays in the guest ("staged") and the
+// host reads it in slices: usd_written_size, usd_written_slice, usd_written_release. One staged result at a
+// time; the next staging write replaces it. The *_staged entry points always stage and answer the size.
+constexpr size_t kSliceLimit = size_t(8) << 20; // bytes one usd_written_slice may return
+static std::string g_written;
+static bool g_has_written = false;
+
+static Variant stage(std::string &&bytes, bool force, const char *what, bool as_text) {
+	if (!force && bytes.size() <= kWholeLimit) {
+		if (as_text) {
+			return text(bytes);
+		}
+		return Variant(PackedArray<uint8_t>((const uint8_t *)bytes.data(), bytes.size()));
+	}
+	g_written = std::move(bytes);
+	g_has_written = true;
+	if (force) {
+		return Variant((int64_t)g_written.size());
+	}
+	return text("STAGED: " + std::to_string(g_written.size()) + " bytes (" + what + "), read them with usd_written_slice");
+}
+
+static Variant write_curves_call(PackedArray<float> points, PackedArray<int32_t> counts, PackedArray<int32_t> boundary,
+		String names, String meta, bool staged) {
 	return guarded("usd_write_curves", [&] {
 		const std::vector<float> p = points.fetch();
 		const std::vector<int32_t> c = counts.fetch();
@@ -422,8 +444,22 @@ static Variant usd_write_curves(PackedArray<float> points, PackedArray<int32_t> 
 			}
 			m.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
 		}
-		return text(usdg::write_curves(p.data(), p.size() / 3, c.data(), c.size(), n, b, m));
+		std::string r = usdg::write_curves(p.data(), p.size() / 3, c.data(), c.size(), n, b, m);
+		if (r.compare(0, 5, "ERR: ") == 0) {
+			return text(r);
+		}
+		return stage(std::move(r), staged, "usd_write_curves", true);
 	});
+}
+
+static Variant usd_write_curves(PackedArray<float> points, PackedArray<int32_t> counts, PackedArray<int32_t> boundary,
+		String names, String meta) {
+	return write_curves_call(points, counts, boundary, names, meta, false);
+}
+
+static Variant usd_write_curves_staged(PackedArray<float> points, PackedArray<int32_t> counts, PackedArray<int32_t> boundary,
+		String names, String meta) {
+	return write_curves_call(points, counts, boundary, names, meta, true);
 }
 
 // One mesh as a .usdz package (usdg::write_mesh): the arrays the usd_mesh_* readers return, written back.
@@ -506,10 +542,43 @@ static bool shape_key(const std::string &k, size_t &idx, size_t &jdx, int &kind)
 	return false;
 }
 
-static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> ints, String header, String joints) {
+// Input arrays pushed in pieces (see write_mesh_call).
+static std::vector<float> g_in_f;
+static std::vector<int32_t> g_in_i;
+
+static Variant usd_write_input_floats(PackedArray<float> chunk) {
+	return guarded("usd_write_input_floats", [&] {
+		const std::vector<float> c = chunk.fetch();
+		g_in_f.insert(g_in_f.end(), c.begin(), c.end());
+		return Variant((int64_t)g_in_f.size());
+	});
+}
+
+static Variant usd_write_input_ints(PackedArray<int32_t> chunk) {
+	return guarded("usd_write_input_ints", [&] {
+		const std::vector<int32_t> c = chunk.fetch();
+		g_in_i.insert(g_in_i.end(), c.begin(), c.end());
+		return Variant((int64_t)g_in_i.size());
+	});
+}
+
+static Variant usd_write_input_clear() {
+	std::vector<float>().swap(g_in_f);
+	std::vector<int32_t>().swap(g_in_i);
+	return text("ok");
+}
+
+static Variant write_mesh_call(PackedArray<float> floats, PackedArray<int32_t> ints, String header, String joints, bool staged) {
 	return guarded("usd_write_mesh", [&] {
-		const std::vector<float> f = floats.fetch();
-		const std::vector<int32_t> n = ints.fetch();
+		// Header "input=pushed": the arrays are the ones pushed with usd_write_input_floats / usd_write_input_ints (a
+		// host call carries at most 16 MiB an array), not the arguments; they are taken, so the next write starts empty.
+		const bool pushed = header.utf8().find("\ninput=pushed") != std::string::npos;
+		const std::vector<float> f = pushed ? std::move(g_in_f) : floats.fetch();
+		const std::vector<int32_t> n = pushed ? std::move(g_in_i) : ints.fetch();
+		if (pushed) {
+			g_in_f.clear();
+			g_in_i.clear();
+		}
 		std::string name;
 		size_t np = 0, nuv = 0, nrest = 0, nf = 0, ni = 0, nshapes = 0, clip_frames = 0;
 		double clip_fps = 0.0;
@@ -538,6 +607,8 @@ static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> in
 				nf = v;
 			} else if (k == "ni") {
 				ni = v;
+			} else if (k == "input") {
+				// input=pushed, handled above
 			} else if (k == "nshapes") {
 				nshapes = v;
 			} else if (k == "clip_frames") {
@@ -680,16 +751,52 @@ static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> in
 			}
 		}
 		const std::vector<int32_t> c(n.begin(), n.begin() + nf), ix(n.begin() + nf, n.begin() + nf + ni);
-		const std::string z = usdg::write_mesh(name, pts, np, c, ix, nuv ? uv : nullptr, j, pa, rest.data(), bind.data(),
+		std::string z = usdg::write_mesh(name, pts, np, c, ix, nuv ? uv : nullptr, j, pa, rest.data(), bind.data(),
 				n.data() + nf + ni, w, element_size, m, shapes, clip.frames ? &clip : nullptr);
 		if (z.compare(0, 5, "ERR: ") == 0) {
 			return text(z);
 		}
-		if (z.size() > kWholeLimit) {
-			return fail("usd_write_mesh: " + std::to_string(z.size()) + " bytes is past the 16 MiB view");
-		}
-		return Variant(PackedArray<uint8_t>((const uint8_t *)z.data(), z.size()));
+		return stage(std::move(z), staged, "usd_write_mesh", false);
 	});
+}
+
+static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> ints, String header, String joints) {
+	return write_mesh_call(floats, ints, header, joints, false);
+}
+
+static Variant usd_write_mesh_staged(PackedArray<float> floats, PackedArray<int32_t> ints, String header, String joints) {
+	return write_mesh_call(floats, ints, header, joints, true);
+}
+
+static Variant usd_written_size() {
+	return Variant((int64_t)(g_has_written ? g_written.size() : 0));
+}
+
+// Bytes [from, from + count) of the staged result, count capped at 8 MiB; an error String when nothing is
+// staged, count is not positive, or from is not inside the result.
+static Variant usd_written_slice(int from, int count) {
+	return guarded("usd_written_slice", [&] {
+		if (!g_has_written) {
+			return fail("usd_written_slice: nothing is staged");
+		}
+		if (count <= 0) {
+			return fail("usd_written_slice: count " + std::to_string(count) + " is not positive");
+		}
+		if (from < 0 || (size_t)from >= g_written.size()) {
+			return fail("usd_written_slice: from " + std::to_string(from) + " is outside the " + std::to_string(g_written.size()) + " staged bytes");
+		}
+		size_t cnt = (size_t)count > kSliceLimit ? kSliceLimit : (size_t)count;
+		if ((size_t)from + cnt > g_written.size()) {
+			cnt = g_written.size() - (size_t)from;
+		}
+		return Variant(PackedArray<uint8_t>((const uint8_t *)g_written.data() + from, cnt));
+	});
+}
+
+static Variant usd_written_release() {
+	std::string().swap(g_written);
+	g_has_written = false;
+	return text("ok");
 }
 
 // RFD66606-2277 A2: one motion clip as a UsdSkel .usda (usdg::write_skel_clip).
@@ -702,8 +809,15 @@ static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> in
 // frames x K weights (row per frame, shape order). frames = len / (anim_joints x 12 + K). With no animated
 // joints the clip is weights only and meta clip_frames=F gives the frame count. Without nshapes the call
 // is as it was.
-static Variant usd_write_skel_clip(String names, PackedArray<int32_t> parents, PackedArray<float> rests,
-		PackedArray<int32_t> anim_joints, PackedArray<float> anim_local, double fps, String meta) {
+static Variant finish_clip(std::string &&r, bool staged) {
+	if (r.compare(0, 5, "ERR: ") == 0) {
+		return text(r);
+	}
+	return stage(std::move(r), staged, "usd_write_skel_clip", true);
+}
+
+static Variant write_skel_clip_call(String names, PackedArray<int32_t> parents, PackedArray<float> rests,
+		PackedArray<int32_t> anim_joints, PackedArray<float> anim_local, double fps, String meta, bool staged) {
 	return guarded("usd_write_skel_clip", [&] {
 		const std::vector<std::string> n = lines_of(names.utf8());
 		const std::vector<int32_t> p = parents.fetch();
@@ -749,8 +863,9 @@ static Variant usd_write_skel_clip(String names, PackedArray<int32_t> parents, P
 			if (aj.empty() || al.size() % (aj.size() * 12) != 0) {
 				return fail("usd_write_skel_clip: animation floats are not frames x joints x 12");
 			}
-			return text(usdg::write_skel_clip(n, p, rest_local.data(), bind_world.data(), aj, al.data(),
-					al.size() / (aj.size() * 12), fps, m));
+			return finish_clip(usdg::write_skel_clip(n, p, rest_local.data(), bind_world.data(), aj, al.data(),
+									   al.size() / (aj.size() * 12), fps, m),
+					staged);
 		}
 		std::vector<std::string> shapes;
 		for (size_t i = 0; i < nshapes; ++i) {
@@ -779,9 +894,20 @@ static Variant usd_write_skel_clip(String names, PackedArray<int32_t> parents, P
 				return fail("usd_write_skel_clip: clip_frames=" + std::to_string(clip_frames) + " but the floats hold " + std::to_string(frames));
 			}
 		}
-		return text(usdg::write_skel_clip(n, p, rest_local.data(), bind_world.data(), aj, al.data(), frames, fps, m, shapes,
-				al.data() + frames * aj.size() * 12));
+		return finish_clip(usdg::write_skel_clip(n, p, rest_local.data(), bind_world.data(), aj, al.data(), frames, fps, m, shapes,
+								   al.data() + frames * aj.size() * 12),
+				staged);
 	});
+}
+
+static Variant usd_write_skel_clip(String names, PackedArray<int32_t> parents, PackedArray<float> rests,
+		PackedArray<int32_t> anim_joints, PackedArray<float> anim_local, double fps, String meta) {
+	return write_skel_clip_call(names, parents, rests, anim_joints, anim_local, fps, meta, false);
+}
+
+static Variant usd_write_skel_clip_staged(String names, PackedArray<int32_t> parents, PackedArray<float> rests,
+		PackedArray<int32_t> anim_joints, PackedArray<float> anim_local, double fps, String meta) {
+	return write_skel_clip_call(names, parents, rests, anim_joints, anim_local, fps, meta, true);
 }
 
 static Variant usd_skel_anim_count() {
@@ -1081,10 +1207,25 @@ int main() {
 			"A .usda of linear BasisCurves under /Creation (names and k=v meta one per line), or ERR:");
 	ADD_API_FUNCTION(usd_write_mesh, "PackedByteArray",
 			"PackedFloat32Array floats, PackedInt32Array ints, String header, String joints",
-			"A .usdz package of one mesh with its uvs, skin, optional sparse blend shapes and weight clip (header keys nshapes, shape<i>, shape<i>_n, shape<i>_normals, clip_frames, clip_fps; four packed arguments: the host has seven registers), or an ERR: String");
+			"A .usdz package of one mesh with its uvs, skin, optional sparse blend shapes and weight clip (header keys nshapes, shape<i>, shape<i>_n, shape<i>_normals, clip_frames, clip_fps; four packed arguments: the host has seven registers), or an ERR: String. A package past the host's 16 MiB view is staged instead: the answer is a String that starts with STAGED and usd_written_slice reads it");
 	ADD_API_FUNCTION(usd_write_skel_clip, "String",
 			"String names, PackedInt32Array parents, PackedFloat32Array rests, PackedInt32Array anim_joints, PackedFloat32Array anim_local, float fps, String meta",
 			"A .usda of one UsdSkel motion clip (RFD 2277 A2), optionally with blend-shape weights in the same SkelAnimation (meta nshapes, shape<i>, clip_frames; weights after the transform floats), or ERR:");
+	ADD_API_FUNCTION(usd_write_curves_staged, "Variant",
+			"PackedFloat32Array points, PackedInt32Array counts, PackedInt32Array boundary, String names, String meta",
+			"usd_write_curves, but the .usda text is always staged in the guest: answers its size in bytes (int) or an ERR: String; read it with usd_written_slice");
+	ADD_API_FUNCTION(usd_write_mesh_staged, "Variant",
+			"PackedFloat32Array floats, PackedInt32Array ints, String header, String joints",
+			"usd_write_mesh, but the package is always staged in the guest: answers its size in bytes (int) or an ERR: String; read it with usd_written_slice");
+	ADD_API_FUNCTION(usd_write_skel_clip_staged, "Variant",
+			"String names, PackedInt32Array parents, PackedFloat32Array rests, PackedInt32Array anim_joints, PackedFloat32Array anim_local, float fps, String meta",
+			"usd_write_skel_clip, but the .usda text is always staged in the guest: answers its size in bytes (int) or an ERR: String; read it with usd_written_slice");
+	ADD_API_FUNCTION(usd_write_input_floats, "Variant", "PackedFloat32Array chunk", "Append a piece to the float input of the next usd_write_mesh / usd_write_mesh_staged whose header has input=pushed; answers the floats held so far");
+	ADD_API_FUNCTION(usd_write_input_ints, "Variant", "PackedInt32Array chunk", "Append a piece to the int input of the next write with input=pushed; answers the ints held so far");
+	ADD_API_FUNCTION(usd_write_input_clear, "String", "", "Drop the pushed write input");
+	ADD_API_FUNCTION(usd_written_size, "int", "", "Bytes of the staged write result, 0 when none");
+	ADD_API_FUNCTION(usd_written_slice, "Variant", "int from, int count", "Bytes [from, from+count) of the staged write result (count capped at 8 MiB), or a FAIL: String when nothing is staged, count is not positive or from is outside the result");
+	ADD_API_FUNCTION(usd_written_release, "String", "", "Free the staged write result");
 	ADD_API_FUNCTION(usd_skel_anim_count, "int", "", "UsdSkelAnimation prims in the document");
 	ADD_API_FUNCTION(usd_skel_anim_info, "Dictionary", "int i", "path, joints, frames, njoints, fps, blend_shapes (original names when kept, one per line), blend_shape_tokens (as authored), nshapes, times");
 	ADD_API_FUNCTION(usd_skel_anim_transforms, "PackedFloat32Array", "int i", "frames x joints x 12: parent-local 3x3 (row-major) then translation");
