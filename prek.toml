@@ -1,3 +1,5 @@
+exclude = '^vendor/|(^|/)(slang_rt|slang-rt|third_party|thirdparty)/|_emit\.cpp$|\.gen\.cpp$'
+
 # Baseline checks that hold for the tree as it is: they only report, they never rewrite.
 [[repos]]
 repo = "builtin"
@@ -11,3 +13,13 @@ hooks = [
   { id = "check-json" },
   { id = "check-xml" },
 ]
+
+[[repos]]
+repo = "https://github.com/pre-commit/mirrors-clang-format"
+rev = "v22.1.5"
+
+# The repository's .clang-format (Godot's), which also sets InsertBraces: every block gets braces.
+[[repos.hooks]]
+id = "clang-format"
+files = '\.(c|h|cpp|hpp|cc|hh|cxx|hxx|inc)$'
+types_or = ["text"]

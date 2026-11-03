@@ -62,41 +62,53 @@ Variant open_bytes(const std::string &bytes) {
 // A slice [from, from + count) of items of `stride` floats; count <= 0 means
 // to the end. Whole answers past kWholeLimit are refused.
 Variant float_slice(const char *what, const float *data, size_t n_items, size_t stride, long from, long count) {
-	if (!data)
+	if (!data) {
 		return fail(std::string(what) + ": no such mesh or attribute");
-	if (from < 0 || (size_t)from > n_items)
+	}
+	if (from < 0 || (size_t)from > n_items) {
 		return fail(std::string(what) + ": from out of range");
+	}
 	size_t cnt = count <= 0 ? n_items - (size_t)from : (size_t)count;
-	if ((size_t)from + cnt > n_items)
+	if ((size_t)from + cnt > n_items) {
 		cnt = n_items - (size_t)from;
-	if (cnt * stride * sizeof(float) > kWholeLimit)
+	}
+	if (cnt * stride * sizeof(float) > kWholeLimit) {
 		return fail(std::string(what) + ": " + std::to_string(cnt * stride * sizeof(float)) + " bytes is past the 16 MiB view, use slices");
+	}
 	return Variant(PackedArray<float>(data + (size_t)from * stride, cnt * stride));
 }
 
 Variant int_slice(const char *what, const int32_t *data, size_t n_items, size_t stride, long from, long count) {
-	if (!data)
+	if (!data) {
 		return fail(std::string(what) + ": no such mesh");
-	if (from < 0 || (size_t)from > n_items)
+	}
+	if (from < 0 || (size_t)from > n_items) {
 		return fail(std::string(what) + ": from out of range");
+	}
 	size_t cnt = count <= 0 ? n_items - (size_t)from : (size_t)count;
-	if ((size_t)from + cnt > n_items)
+	if ((size_t)from + cnt > n_items) {
 		cnt = n_items - (size_t)from;
-	if (cnt * stride * sizeof(int32_t) > kWholeLimit)
+	}
+	if (cnt * stride * sizeof(int32_t) > kWholeLimit) {
 		return fail(std::string(what) + ": " + std::to_string(cnt * stride * sizeof(int32_t)) + " bytes is past the 16 MiB view, use slices");
+	}
 	return Variant(PackedArray<int32_t>(data + (size_t)from * stride, cnt * stride));
 }
 
 Variant byte_slice(const char *what, const uint8_t *data, size_t n, long from, long count) {
-	if (!data)
+	if (!data) {
 		return fail(std::string(what) + ": no such texture");
-	if (from < 0 || (size_t)from > n)
+	}
+	if (from < 0 || (size_t)from > n) {
 		return fail(std::string(what) + ": from out of range");
+	}
 	size_t cnt = count <= 0 ? n - (size_t)from : (size_t)count;
-	if ((size_t)from + cnt > n)
+	if ((size_t)from + cnt > n) {
 		cnt = n - (size_t)from;
-	if (cnt > kWholeLimit)
+	}
+	if (cnt > kWholeLimit) {
 		return fail(std::string(what) + ": " + std::to_string(cnt) + " bytes is past the 16 MiB view, use slices");
+	}
 	return Variant(PackedArray<uint8_t>(data + (size_t)from, cnt));
 }
 
@@ -161,8 +173,9 @@ static Variant usd_asset_list() {
 		const std::vector<std::string> v = usdg::asset_list();
 		std::string out;
 		for (size_t i = 0; i < v.size(); ++i) {
-			if (i)
+			if (i) {
 				out += "\n";
+			}
 			out += v[i];
 		}
 		return text(out);
@@ -199,8 +212,9 @@ static Variant usd_texture_count() {
 static Variant usd_mesh_info(int i) {
 	return guarded("usd_mesh_info", [&] {
 		usdg::MeshInfo m;
-		if (!usdg::mesh_info(i, m))
+		if (!usdg::mesh_info(i, m)) {
 			return fail("usd_mesh_info: no mesh " + std::to_string(i) + " (count " + std::to_string(usdg::mesh_count()) + ")");
+		}
 		Dictionary d = Dictionary::Create();
 		d["path"] = text(m.path);
 		d["name"] = text(m.name);
@@ -289,8 +303,9 @@ static Variant usd_mesh_indices_slice(int i, int from, int count) {
 static Variant usd_mesh_transform(int i) {
 	return guarded("usd_mesh_transform", [&] {
 		usdg::MeshInfo m;
-		if (!usdg::mesh_info(i, m))
+		if (!usdg::mesh_info(i, m)) {
 			return fail("usd_mesh_transform: no mesh " + std::to_string(i));
+		}
 		return Variant(PackedArray<float>(m.xform, 16));
 	});
 }
@@ -298,8 +313,9 @@ static Variant usd_mesh_transform(int i) {
 static Variant usd_texture_info(int i) {
 	return guarded("usd_texture_info", [&] {
 		usdg::TextureInfo t;
-		if (!usdg::texture_info(i, t))
+		if (!usdg::texture_info(i, t)) {
 			return fail("usd_texture_info: no texture " + std::to_string(i));
+		}
 		Dictionary d = Dictionary::Create();
 		d["path"] = text(t.path);
 		d["file"] = text(t.file);
@@ -340,8 +356,9 @@ static Variant usd_curve_count() {
 static Variant usd_curve_info(int i) {
 	return guarded("usd_curve_info", [&] {
 		usdg::CurveInfo c;
-		if (!usdg::curve_info(i, c))
+		if (!usdg::curve_info(i, c)) {
 			return fail("usd_curve_info: no curve " + std::to_string(i) + " (count " + std::to_string(usdg::curve_count()) + ")");
+		}
 		Dictionary d = Dictionary::Create();
 		d["path"] = text(c.path);
 		d["name"] = text(c.name);
@@ -364,8 +381,9 @@ static Variant usd_curve_points(int i) {
 static Variant usd_layer_data() {
 	return guarded("usd_layer_data", [] {
 		Dictionary d = Dictionary::Create();
-		for (const std::pair<std::string, std::string> &kv : usdg::layer_data())
+		for (const std::pair<std::string, std::string> &kv : usdg::layer_data()) {
 			d[kv.first] = text(kv.second);
+		}
 		return Variant(d);
 	});
 }
@@ -376,8 +394,9 @@ static std::vector<std::string> lines_of(const std::string &s) {
 	size_t at = 0;
 	while (at < s.size()) {
 		size_t nl = s.find('\n', at);
-		if (nl == std::string::npos)
+		if (nl == std::string::npos) {
 			nl = s.size();
+		}
 		out.push_back(s.substr(at, nl - at));
 		at = nl + 1;
 	}
@@ -390,20 +409,21 @@ static Variant usd_write_curves(PackedArray<float> points, PackedArray<int32_t> 
 		const std::vector<float> p = points.fetch();
 		const std::vector<int32_t> c = counts.fetch();
 		const std::vector<int32_t> b = boundary.fetch();
-		if (p.size() % 3 != 0)
+		if (p.size() % 3 != 0) {
 			return fail("usd_write_curves: " + std::to_string(p.size()) + " floats is not whole xyz points");
+		}
 		const std::vector<std::string> n = lines_of(names.utf8());
 		std::vector<std::pair<std::string, std::string>> m;
 		for (const std::string &kv : lines_of(meta.utf8())) {
 			const size_t eq = kv.find('=');
-			if (eq == std::string::npos)
+			if (eq == std::string::npos) {
 				return fail("usd_write_curves: meta line '" + kv + "' has no '='");
+			}
 			m.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
 		}
 		return text(usdg::write_curves(p.data(), p.size() / 3, c.data(), c.size(), n, b, m));
 	});
 }
-
 
 // One mesh as a .usdz package (usdg::write_mesh): the arrays the usd_mesh_* readers return, written back.
 // The host puts a call's arguments in registers a1..a7, so the call packs into four. header: line 1 is
@@ -420,41 +440,57 @@ static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> in
 		size_t np = 0, nuv = 0, nrest = 0, nf = 0, ni = 0;
 		std::vector<std::pair<std::string, std::string>> m;
 		for (const std::string &ln : lines_of(header.utf8())) {
-			if (name.empty()) { name = ln; continue; }
+			if (name.empty()) {
+				name = ln;
+				continue;
+			}
 			const size_t eq = ln.find('=');
-			if (eq == std::string::npos)
+			if (eq == std::string::npos) {
 				return fail("usd_write_mesh: header line '" + ln + "' has no '='");
+			}
 			const std::string k = ln.substr(0, eq);
 			const size_t v = (size_t)std::atoll(ln.c_str() + eq + 1);
-			if (k == "np") np = v;
-			else if (k == "nuv") nuv = v;
-			else if (k == "nrest") nrest = v;
-			else if (k == "nf") nf = v;
-			else if (k == "ni") ni = v;
-			else m.emplace_back(k, ln.substr(eq + 1));
+			if (k == "np") {
+				np = v;
+			} else if (k == "nuv") {
+				nuv = v;
+			} else if (k == "nrest") {
+				nrest = v;
+			} else if (k == "nf") {
+				nf = v;
+			} else if (k == "ni") {
+				ni = v;
+			} else {
+				m.emplace_back(k, ln.substr(eq + 1));
+			}
 		}
-		if (f.size() < np * 3 + nuv + nrest || n.size() < nf + ni)
+		if (f.size() < np * 3 + nuv + nrest || n.size() < nf + ni) {
 			return fail("usd_write_mesh: the arrays are shorter than the header sizes");
+		}
 		const size_t nw = f.size() - np * 3 - nuv - nrest, nsi = n.size() - nf - ni;
 		const float *pts = f.data(), *uv = pts + np * 3, *rests = uv + nuv, *w = rests + nrest;
 		std::vector<std::string> j;
 		std::vector<int32_t> pa;
 		for (const std::string &ln : lines_of(joints.utf8())) {
 			const size_t tab = ln.find('\t');
-			if (tab == std::string::npos)
+			if (tab == std::string::npos) {
 				return fail("usd_write_mesh: joint line '" + ln + "' has no tab and parent");
+			}
 			j.push_back(ln.substr(0, tab));
 			pa.push_back(std::atoi(ln.c_str() + tab + 1));
 		}
-		if (nuv != 0 && nuv != np * 2)
+		if (nuv != 0 && nuv != np * 2) {
 			return fail("usd_write_mesh: " + std::to_string(nuv) + " uv floats for " + std::to_string(np) + " points");
+		}
 		std::vector<float> rest, bind;
 		size_t element_size = 0;
 		if (!j.empty()) {
-			if (nrest != j.size() * 24)
+			if (nrest != j.size() * 24) {
 				return fail("usd_write_mesh: rests are not J x 24");
-			if (np == 0 || nw == 0 || nw % np != 0 || nsi != nw)
+			}
+			if (np == 0 || nw == 0 || nw % np != 0 || nsi != nw) {
 				return fail("usd_write_mesh: skin arrays are not points x element_size");
+			}
 			element_size = nw / np;
 			for (size_t k = 0; k < j.size(); ++k) {
 				rest.insert(rest.end(), rests + k * 24, rests + k * 24 + 12);
@@ -464,10 +500,12 @@ static Variant usd_write_mesh(PackedArray<float> floats, PackedArray<int32_t> in
 		const std::vector<int32_t> c(n.begin(), n.begin() + nf), ix(n.begin() + nf, n.begin() + nf + ni);
 		const std::string z = usdg::write_mesh(name, pts, np, c, ix, nuv ? uv : nullptr, j, pa, rest.data(), bind.data(),
 				n.data() + nf + ni, w, element_size, m);
-		if (z.compare(0, 5, "ERR: ") == 0)
+		if (z.compare(0, 5, "ERR: ") == 0) {
 			return text(z);
-		if (z.size() > kWholeLimit)
+		}
+		if (z.size() > kWholeLimit) {
 			return fail("usd_write_mesh: " + std::to_string(z.size()) + " bytes is past the 16 MiB view");
+		}
 		return Variant(PackedArray<uint8_t>((const uint8_t *)z.data(), z.size()));
 	});
 }
@@ -483,10 +521,12 @@ static Variant usd_write_skel_clip(String names, PackedArray<int32_t> parents, P
 		const std::vector<float> r = rests.fetch();
 		const std::vector<int32_t> aj = anim_joints.fetch();
 		const std::vector<float> al = anim_local.fetch();
-		if (r.size() != n.size() * 24)
+		if (r.size() != n.size() * 24) {
 			return fail("usd_write_skel_clip: " + std::to_string(r.size()) + " rest floats for " + std::to_string(n.size()) + " joints");
-		if (aj.empty() || al.size() % (aj.size() * 12) != 0)
+		}
+		if (aj.empty() || al.size() % (aj.size() * 12) != 0) {
 			return fail("usd_write_skel_clip: animation floats are not frames x joints x 12");
+		}
 		std::vector<float> rest_local(n.size() * 12), bind_world(n.size() * 12);
 		for (size_t j = 0; j < n.size(); ++j) {
 			std::copy(&r[j * 24], &r[j * 24 + 12], &rest_local[j * 12]);
@@ -495,8 +535,9 @@ static Variant usd_write_skel_clip(String names, PackedArray<int32_t> parents, P
 		std::vector<std::pair<std::string, std::string>> m;
 		for (const std::string &kv : lines_of(meta.utf8())) {
 			const size_t eq = kv.find('=');
-			if (eq == std::string::npos)
+			if (eq == std::string::npos) {
 				return fail("usd_write_skel_clip: meta line '" + kv + "' has no '='");
+			}
 			m.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
 		}
 		return text(usdg::write_skel_clip(n, p, rest_local.data(), bind_world.data(), aj, al.data(),
@@ -511,8 +552,9 @@ static Variant usd_skel_anim_count() {
 static Variant usd_skel_anim_info(int i) {
 	return guarded("usd_skel_anim_info", [&] {
 		usdg::SkelAnimInfo a;
-		if (!usdg::skel_anim_info(i, a))
+		if (!usdg::skel_anim_info(i, a)) {
 			return fail("usd_skel_anim_info: no animation " + std::to_string(i));
+		}
 		Dictionary d = Dictionary::Create();
 		d["path"] = text(a.path);
 		d["joints"] = text(a.joints);
@@ -529,19 +571,23 @@ static Variant usd_skel_anim_info(int i) {
 static Variant usd_skel_anim_transforms(int i) {
 	size_t n = 0;
 	const float *p = usdg::skel_anim_transforms(i, n);
-	if (!p)
+	if (!p) {
 		return fail("usd_skel_anim_transforms: no animation " + std::to_string(i));
-	if (n * sizeof(float) > kWholeLimit)
+	}
+	if (n * sizeof(float) > kWholeLimit) {
 		return fail("usd_skel_anim_transforms: past the 16 MiB view");
+	}
 	return Variant(PackedArray<float>(p, n));
 }
 static Variant usd_skel_anim_blend_weights(int i) {
 	size_t n = 0;
 	const float *p = usdg::skel_anim_blend_weights(i, n);
-	if (!p)
+	if (!p) {
 		return fail("usd_skel_anim_blend_weights: no animation " + std::to_string(i));
-	if (n * sizeof(float) > kWholeLimit)
+	}
+	if (n * sizeof(float) > kWholeLimit) {
 		return fail("usd_skel_anim_blend_weights: past the 16 MiB view");
+	}
 	return Variant(PackedArray<float>(p, n));
 }
 
@@ -552,8 +598,9 @@ static Variant usd_blend_shape_count() {
 static Variant usd_blend_shape_info(int k) {
 	return guarded("usd_blend_shape_info", [&] {
 		usdg::BlendShapeInfo b;
-		if (!usdg::blend_shape_info(k, b))
+		if (!usdg::blend_shape_info(k, b)) {
 			return fail("usd_blend_shape_info: no blend shape " + std::to_string(k) + " (count " + std::to_string(usdg::blend_shape_count()) + ")");
+		}
 		Dictionary d = Dictionary::Create();
 		d["name"] = text(b.name);
 		d["mesh"] = Variant(b.mesh);
@@ -589,8 +636,9 @@ static Variant usd_skeleton_count() {
 static Variant usd_skeleton_info(int i) {
 	return guarded("usd_skeleton_info", [&] {
 		usdg::SkeletonInfo s;
-		if (!usdg::skeleton_info(i, s))
+		if (!usdg::skeleton_info(i, s)) {
 			return fail("usd_skeleton_info: no skeleton " + std::to_string(i) + " (count " + std::to_string(usdg::skeleton_count()) + ")");
+		}
 		Dictionary d = Dictionary::Create();
 		d["path"] = text(s.path);
 		d["joints"] = text(s.joints);
@@ -640,8 +688,9 @@ static Variant usd_skeleton_rests_slice(int i, int from, int count) {
 static Variant usd_mesh_skin(int i) {
 	return guarded("usd_mesh_skin", [&] {
 		usdg::SkinInfo k;
-		if (!usdg::mesh_skin(i, k))
+		if (!usdg::mesh_skin(i, k)) {
 			return fail("usd_mesh_skin: mesh " + std::to_string(i) + " has no skin (meshes " + std::to_string(usdg::mesh_count()) + ")");
+		}
 		Dictionary d = Dictionary::Create();
 		d["skeleton"] = Variant(k.skeleton);
 		d["element_size"] = Variant(k.element_size);
@@ -695,12 +744,14 @@ static Variant usd_mesh_skin_weights_slice(int i, int from, int count) {
 static Variant usd_mesh_skin_pose(int i, PackedArray<float> local, bool normalize) {
 	return guarded("usd_mesh_skin_pose", [&] {
 		const std::vector<float> l = local.fetch();
-		if (l.size() % 12 != 0)
+		if (l.size() % 12 != 0) {
 			return fail("usd_mesh_skin_pose: " + std::to_string(l.size()) + " floats is not whole joints of 12");
+		}
 		std::string why;
 		const std::vector<float> p = usdg::mesh_skin_pose(i, l.data(), l.size() / 12, normalize, why);
-		if (p.empty())
+		if (p.empty()) {
 			return fail("usd_mesh_skin_pose: " + why);
+		}
 		return float_slice("usd_mesh_skin_pose", p.data(), p.size() / 3, 3, 0, 0);
 	});
 }
@@ -713,8 +764,9 @@ static Variant usd_mesh_skin_pose(int i, PackedArray<float> local, bool normaliz
 static Variant usd_material(int i) {
 	return guarded("usd_material", [&] {
 		usdg::MaterialInfo m;
-		if (!usdg::material_info(i, m))
+		if (!usdg::material_info(i, m)) {
 			return fail("usd_material: no material " + std::to_string(i) + " (count " + std::to_string(usdg::material_count()) + ")");
+		}
 		Dictionary d = Dictionary::Create();
 		d["path"] = text(m.path);
 		d["name"] = text(m.name);
@@ -740,8 +792,9 @@ static Variant usd_material(int i) {
 		}
 		size_t n = 0;
 		const uint8_t *p = usdg::texture_bytes(m.diffuse_tex, n);
-		if (p && n <= kWholeLimit)
+		if (p && n <= kWholeLimit) {
 			d["diffuse_bytes"] = Variant(PackedArray<uint8_t>(p, n));
+		}
 		return Variant(d);
 	});
 }

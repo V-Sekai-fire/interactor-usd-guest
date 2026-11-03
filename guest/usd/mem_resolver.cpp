@@ -3,13 +3,13 @@
 
 #include "mem_resolver.h"
 
-#include "pxr/pxr.h"
 #include "pxr/base/plug/registry.h"
-#include "pxr/base/tf/errorMark.h"
 #include "pxr/base/tf/diagnostic.h"
+#include "pxr/base/tf/errorMark.h"
 #include "pxr/base/tf/pathUtils.h"
 #include "pxr/base/tf/type.h"
 #include "pxr/base/work/threadLimits.h"
+#include "pxr/pxr.h"
 #include "pxr/usd/ar/defineResolver.h"
 #include "pxr/usd/ar/inMemoryAsset.h"
 #include "pxr/usd/ar/resolver.h"
@@ -64,10 +64,12 @@ protected:
 	// (the path the host streamed it under). A package-relative path (with a
 	// '[...]' member) is left alone: Ar splits it before this resolver sees it.
 	std::string _CreateIdentifier(const std::string &assetPath, const ArResolvedPath &anchor) const override {
-		if (assetPath.empty() || assetPath.find('[') != std::string::npos)
+		if (assetPath.empty() || assetPath.find('[') != std::string::npos) {
 			return assetPath;
-		if (assetPath[0] == '/' || anchor.empty())
+		}
+		if (assetPath[0] == '/' || anchor.empty()) {
 			return TfNormPath(assetPath);
+		}
 		std::string a = anchor.GetPathString();
 		return TfNormPath(a.substr(0, a.rfind('/') + 1) + assetPath);
 	}
@@ -85,8 +87,9 @@ protected:
 	std::shared_ptr<ArAsset> _OpenAsset(const ArResolvedPath &resolvedPath) const override {
 		std::lock_guard<std::mutex> lk(g_mu);
 		auto it = g_assets.find(resolvedPath.GetPathString());
-		if (it == g_assets.end())
+		if (it == g_assets.end()) {
 			return nullptr;
+		}
 		return ArInMemoryAsset::FromBuffer(std::shared_ptr<const char>(it->second), g_sizes[it->first]);
 	}
 	std::shared_ptr<ArWritableAsset> _OpenAssetForWrite(const ArResolvedPath &, WriteMode) const override {
@@ -123,24 +126,27 @@ long asset_size(const std::string &path) {
 }
 
 static std::string first_error(const TfErrorMark &m) {
-	for (auto it = m.GetBegin(); it != m.GetEnd(); ++it)
+	for (auto it = m.GetBegin(); it != m.GetEnd(); ++it) {
 		return it->GetCommentary();
+	}
 	return "unknown";
 }
 
 static std::string g_init;
 
 std::string init() {
-	if (!g_init.empty())
+	if (!g_init.empty()) {
 		return g_init;
+	}
 	TfErrorMark mark;
 	WorkSetConcurrencyLimit(1);
 	std::vector<std::string> plugs;
 	for (const UsdProbeResource &r : kUsdResources) {
 		put_asset(r.path, r.data, r.size);
 		std::string p = r.path;
-		if (p.size() > 14 && p.compare(p.size() - 14, 14, "/plugInfo.json") == 0)
+		if (p.size() > 14 && p.compare(p.size() - 14, 14, "/plugInfo.json") == 0) {
 			plugs.push_back(p);
+		}
 	}
 	put_asset("/usd/usdProbe/resources/plugInfo.json", kProbePlugInfo, std::strlen(kProbePlugInfo));
 	plugs.push_back("/usd/usdProbe/resources/plugInfo.json");
