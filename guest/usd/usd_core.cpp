@@ -46,9 +46,9 @@
 #include "pxr/usd/usd/stage.h"
 #include "pxr/usd/usdGeom/basisCurves.h"
 #include "pxr/usd/usdGeom/mesh.h"
-#include "pxr/usd/usdGeom/scope.h"
 #include "pxr/usd/usdGeom/metrics.h"
 #include "pxr/usd/usdGeom/primvarsAPI.h"
+#include "pxr/usd/usdGeom/scope.h"
 #include "pxr/usd/usdGeom/subset.h"
 #include "pxr/usd/usdGeom/tokens.h"
 #include "pxr/usd/usdGeom/xform.h"
@@ -106,6 +106,8 @@ struct MeshRec {
 	bool double_sided = false;
 	size_t surf_off = 0, nsurf = 0; // into g_surfaces, 3 ints a surface
 	size_t shape_first = 0, nshapes = 0; // into g_shapes
+	Span subsets; // non-materialBind GeomSubsets, "family/name=faces" a line
+	int nsubsets = 0;
 };
 
 // One blend-shape target of a mesh, densified to one offset per vertex of the
@@ -785,6 +787,22 @@ std::string add_mesh(const UsdPrim &prim, UsdGeomXformCache &xc, const std::stri
 			return err;
 		}
 	}
+	{
+		std::string lines;
+		const TfToken bind_family("materialBind");
+		for (const UsdGeomSubset &sub : UsdGeomSubset::GetAllGeomSubsets(mesh)) {
+			TfToken fam;
+			sub.GetFamilyNameAttr().Get(&fam);
+			if (fam == bind_family) {
+				continue;
+			}
+			VtIntArray faces;
+			sub.GetIndicesAttr().Get(&faces, UsdTimeCode::Default());
+			lines += fam.GetString() + "/" + sub.GetPrim().GetName().GetString() + "=" + std::to_string(faces.size()) + "\n";
+			++r.nsubsets;
+		}
+		r.subsets = intern(lines);
+	}
 	r.material = group_mat[0];
 	g_meshes.push_back(r);
 	return "";
@@ -1356,6 +1374,8 @@ bool mesh_info(int i, MeshInfo &out) {
 	out.surfaces.assign(g_surfaces.begin() + (long)r.surf_off, g_surfaces.begin() + (long)(r.surf_off + 3 * r.nsurf));
 	out.shape_first = (int)r.shape_first;
 	out.shapes = (int)r.nshapes;
+	out.subsets = str(r.subsets);
+	out.subset_count = r.nsubsets;
 	return true;
 }
 
@@ -2159,10 +2179,18 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 		const std::vector<int32_t> &parents, const float *rest_local, const float *bind_world, const int32_t *skin_indices,
 		const float *skin_weights, size_t element_size, const std::vector<std::pair<std::string, std::string>> &meta,
 		const std::vector<BlendShapeIn> &shapes, const BlendClipIn *clip, const MaterialIn *material,
-		const std::map<std::string, std::string> *textures) {
+		const std::map<std::string, std::string> *textures, const std::vector<int32_t> &face_labels) {
 	const std::string init = usdmem::init();
 	if (init.compare(0, 3, "ok ") != 0) {
 		return "ERR: init: " + init;
+	}
+	if (!face_labels.empty() && face_labels.size() != counts.size()) {
+		return "ERR: " + std::to_string(face_labels.size()) + " face labels for " + std::to_string(counts.size()) + " faces";
+	}
+	for (int32_t l : face_labels) {
+		if (l != 0 && l != 1) {
+			return "ERR: face label " + std::to_string(l) + " is not 0 (rigid) or 1 (soft)";
+		}
 	}
 	if (!SdfPath::IsValidIdentifier(name)) {
 		return "ERR: '" + name + "' is not a valid prim name";
@@ -2316,6 +2344,16 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 			cld[kv.first] = VtValue(kv.second);
 		}
 		stage->GetRootLayer()->SetCustomLayerData(cld);
+		std::string doc;
+		for (const char *k : { "author", "license", "license_url", "author_url" }) {
+			auto it = cld.find(k);
+			if (it != cld.end() && it->second.IsHolding<std::string>()) {
+				doc += std::string(doc.empty() ? "" : "; ") + k + ": " + it->second.UncheckedGet<std::string>();
+			}
+		}
+		if (!doc.empty()) {
+			stage->GetRootLayer()->SetDocumentation(doc);
+		}
 		UsdGeomMesh mesh;
 		if (skinned) {
 			UsdSkelRoot root = UsdSkelRoot::Define(stage, SdfPath(root_path));
@@ -2537,6 +2575,15 @@ std::string write_mesh(const std::string &name, const float *points, size_t n_po
 				UsdSkelBindingAPI holder = skinned ? UsdSkelBindingAPI::Apply(stage->GetPrimAtPath(SdfPath(root_path + "/Skeleton"))) : bapi;
 				holder.CreateAnimationSourceRel().SetTargets({ anim.GetPath() });
 			}
+		}
+		if (!face_labels.empty()) {
+			const TfToken family("rigidSoft");
+			VtIntArray rigid, soft;
+			for (size_t f = 0; f < face_labels.size(); ++f) {
+				(face_labels[f] == 0 ? rigid : soft).push_back((int)f);
+			}
+			UsdGeomSubset::CreateGeomSubset(mesh, TfToken("rigid"), UsdGeomTokens->face, rigid, family, UsdGeomTokens->partition);
+			UsdGeomSubset::CreateGeomSubset(mesh, TfToken("soft"), UsdGeomTokens->face, soft, family, UsdGeomTokens->partition);
 		}
 		std::string text;
 		if (!stage->GetRootLayer()->ExportToString(&text)) {
